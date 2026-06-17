@@ -1013,13 +1013,67 @@ mod tests {
                 u16::from(ExtensionType::SupportedVersions),
                 u16::from(ExtensionType::ServerName),
                 u16::from(ExtensionType::SignatureAlgorithms),
+                u16::from(ExtensionType::EllipticCurves),
                 0x1a1a,
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::KeyShare),
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+            ])
+            .expect_extension_body(0x0a0a, ExpectedExtensionBody::Exact(vec![]))
+            .expect_extension_body(0x1a1a, ExpectedExtensionBody::Exact(vec![0]))
+            .assert_matches_encoded(&encoded);
+    }
+
+    #[test]
+    fn client_hello_customizer_can_place_second_grease_extension_after_last_real_extension() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 0, vec![]).unwrap())
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 9, vec![0]).unwrap())
+            .unwrap();
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_extension_order(order)
+                    .with_grease(grease),
+            )),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        ClientHelloOracle::new()
+            .expect_extension_order(vec![
+                0x0a0a,
+                u16::from(ExtensionType::SupportedVersions),
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::SignatureAlgorithms),
                 u16::from(ExtensionType::EllipticCurves),
                 u16::from(ExtensionType::ECPointFormats),
                 u16::from(ExtensionType::ExtendedMasterSecret),
                 u16::from(ExtensionType::StatusRequest),
                 u16::from(ExtensionType::KeyShare),
                 u16::from(ExtensionType::PSKKeyExchangeModes),
+                0x1a1a,
             ])
             .expect_extension_body(0x0a0a, ExpectedExtensionBody::Exact(vec![]))
             .expect_extension_body(0x1a1a, ExpectedExtensionBody::Exact(vec![0]))
@@ -1238,7 +1292,7 @@ mod tests {
             .with_key_share_position(0)
             .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 0, vec![]).unwrap())
             .unwrap()
-            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 16, vec![0]).unwrap())
+            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 15, vec![0]).unwrap())
             .unwrap();
         let extension_order = ClientHelloExtensionOrder::try_from(vec![
             u16::from(ExtensionType::ServerName),

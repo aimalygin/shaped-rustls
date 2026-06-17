@@ -1047,9 +1047,18 @@ fn insert_positioned_grease(
     order: &mut Vec<ExtensionType>,
     grease: &[(usize, ExtensionType, Payload<'static>)],
 ) {
-    for (position, extension, _) in grease {
-        if *position <= order.len() {
-            order.insert(*position, *extension);
+    let real_order = core::mem::take(order);
+    let real_order_len = real_order.len();
+
+    for position in 0..=real_order_len {
+        for (_, extension, _) in grease
+            .iter()
+            .filter(|(grease_position, _, _)| *grease_position == position)
+        {
+            order.push(*extension);
+        }
+        if position < real_order_len {
+            order.push(real_order[position]);
         }
     }
 }

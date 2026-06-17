@@ -921,7 +921,10 @@ impl ClientHelloGreaseExtension {
         self.value
     }
 
-    /// Return the insertion position in the non-final extension order.
+    /// Return the insertion position in the non-GREASE non-final extension order.
+    ///
+    /// Position `0` inserts before the first real extension, and position
+    /// `len` inserts after the last real extension.
     pub fn position(&self) -> usize {
         self.position
     }
@@ -973,7 +976,10 @@ impl ClientHelloGreasePlan {
         self
     }
 
-    /// Insert the GREASE extension into the extension list at `position`.
+    /// Insert the GREASE extension into the non-GREASE extension list at `position`.
+    ///
+    /// Position `0` inserts before the first real extension, and position
+    /// `len` inserts after the last real extension.
     pub fn with_extension_position(mut self, position: usize) -> Self {
         self.extensions
             .retain(|extension| extension.value() != self.value);
@@ -986,7 +992,7 @@ impl ClientHelloGreasePlan {
         self
     }
 
-    /// Insert a GREASE extension entry into the extension list.
+    /// Insert a GREASE extension entry into the non-GREASE extension list.
     pub fn with_extension(mut self, extension: ClientHelloGreaseExtension) -> Result<Self, Error> {
         if self
             .extensions
