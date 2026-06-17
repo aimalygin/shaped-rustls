@@ -931,6 +931,10 @@ extension_struct! {
         ExtensionType::StatusRequest =>
             pub(crate) certificate_status_request: Option<CertificateStatusRequest>,
 
+        /// Signed certificate timestamp is requested (RFC6962)
+        ExtensionType::SCT =>
+            pub(crate) signed_certificate_timestamp: Option<()>,
+
         /// Supported groups (RFC4492/RFC8446)
         ExtensionType::EllipticCurves =>
             pub(crate) named_groups: Option<Vec<NamedGroup>>,
@@ -1029,15 +1033,18 @@ extension_struct! {
         pub(crate) custom_order: Option<Vec<ExtensionType>>,
 
         /// GREASE extensions inserted into the non-final ClientHello extension order.
-        pub(crate) grease_extensions: Vec<(usize, ExtensionType)>,
+        pub(crate) grease_extensions: Vec<(usize, ExtensionType, Payload<'static>)>,
 
         /// Raw unknown extensions inserted into the non-final ClientHello extension order.
         pub(crate) raw_extensions: Vec<(ExtensionType, Payload<'static>)>,
     }
 }
 
-fn insert_positioned_grease(order: &mut Vec<ExtensionType>, grease: &[(usize, ExtensionType)]) {
-    for (position, extension) in grease {
+fn insert_positioned_grease(
+    order: &mut Vec<ExtensionType>,
+    grease: &[(usize, ExtensionType, Payload<'static>)],
+) {
+    for (position, extension, _) in grease {
         if *position <= order.len() {
             order.insert(*position, *extension);
         }
@@ -1049,6 +1056,7 @@ impl ClientExtensions<'_> {
         let Self {
             server_name,
             certificate_status_request,
+            signed_certificate_timestamp,
             named_groups,
             ec_point_formats,
             signature_schemes,
@@ -1080,6 +1088,7 @@ impl ClientExtensions<'_> {
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
             certificate_status_request,
+            signed_certificate_timestamp,
             named_groups,
             ec_point_formats,
             signature_schemes,
@@ -1207,6 +1216,12 @@ impl ClientExtensions<'_> {
             .iter()
             .find_map(|(extension_type, payload)| (*extension_type == item).then_some(payload))
     }
+
+    fn grease_extension_payload(&self, item: ExtensionType) -> Option<&Payload<'static>> {
+        self.grease_extensions
+            .iter()
+            .find_map(|(_, extension_type, payload)| (*extension_type == item).then_some(payload))
+    }
 }
 
 impl<'a> Codec<'a> for ClientExtensions<'a> {
@@ -1219,13 +1234,10 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
 
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         for item in order {
-            if self
-                .grease_extensions
-                .iter()
-                .any(|(_, extension)| *extension == item)
-            {
+            if let Some(payload) = self.grease_extension_payload(item) {
                 item.encode(body.buf);
-                0u16.encode(body.buf);
+                (payload.bytes().len() as u16).encode(body.buf);
+                payload.encode(body.buf);
             } else if let Some(payload) = self.raw_extension_payload(item) {
                 item.encode(body.buf);
                 (payload.bytes().len() as u16).encode(body.buf);

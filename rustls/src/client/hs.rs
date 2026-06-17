@@ -29,7 +29,7 @@ use crate::enums::{
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
-use crate::msgs::base::Payload;
+use crate::msgs::base::{Payload, PayloadU8};
 use crate::msgs::codec::Codec;
 use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
@@ -557,6 +557,22 @@ fn apply_raw_extension_plan(plan: Option<&ClientHelloPlan>, exts: &mut ClientExt
         .collect();
 }
 
+fn apply_forced_extension_plan(plan: Option<&ClientHelloPlan>, exts: &mut ClientExtensions<'_>) {
+    let Some(forced) = plan.and_then(|plan| plan.forced_extensions.as_ref()) else {
+        return;
+    };
+
+    if forced.renegotiation_info_empty() {
+        exts.renegotiation_info = Some(PayloadU8::new(Vec::new()));
+    }
+    if forced.session_ticket_request() {
+        exts.session_ticket = Some(ClientSessionTicket::Request);
+    }
+    if forced.signed_certificate_timestamp_empty() {
+        exts.signed_certificate_timestamp = Some(());
+    }
+}
+
 fn encoded_client_hello_len(payload: &ClientHelloPayload) -> usize {
     let mut bytes = Vec::new();
     HandshakeMessagePayload(HandshakePayload::ClientHello(payload.clone())).encode(&mut bytes);
@@ -596,7 +612,7 @@ fn insert_at<T>(items: &mut Vec<T>, position: usize, value: T, what: &str) -> Re
 }
 
 fn non_final_extension_count(exts: &ClientExtensions<'_>) -> usize {
-    let mut order = exts.collect_used();
+    let mut order = exts.collect_used_with_raw();
     order.retain(|ext| {
         !(matches!(
             ext,
@@ -670,14 +686,18 @@ fn apply_grease_plan(
         )?;
     }
 
-    if let Some(position) = grease.extension_position() {
+    for extension in grease.extensions() {
+        let position = extension.position();
         if position > non_final_extension_count(exts) {
             return Err(Error::General(
                 "ClientHello GREASE position is out of range for extensions".into(),
             ));
         }
-        exts.grease_extensions
-            .push((position, ExtensionType::from(value)));
+        exts.grease_extensions.push((
+            position,
+            ExtensionType::from(extension.value()),
+            Payload::new(extension.payload().to_vec()),
+        ));
     }
 
     Ok(())
@@ -919,9 +939,10 @@ fn emit_client_hello_for_retry(
         &supported_versions,
         config.require_ems,
     )?;
-    apply_grease_plan(input.plan.as_ref(), &mut exts, &mut cipher_suites)?;
-    apply_padding_plan(input.plan.as_ref(), &mut exts)?;
+    apply_forced_extension_plan(input.plan.as_ref(), &mut exts);
     apply_raw_extension_plan(input.plan.as_ref(), &mut exts);
+    apply_padding_plan(input.plan.as_ref(), &mut exts)?;
+    apply_grease_plan(input.plan.as_ref(), &mut exts, &mut cipher_suites)?;
 
     let mut chp_payload = ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_2,

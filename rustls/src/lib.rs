@@ -604,10 +604,11 @@ pub mod client {
         CapturesClientHello, ClientHelloAdvertisedCipherSuites, ClientHelloAlpnProtocols,
         ClientHelloCertificateCompressionAlgorithms, ClientHelloCipherSuites, ClientHelloContext,
         ClientHelloCustomizer, ClientHelloExtensionOrder, ClientHelloExtensionPlan,
-        ClientHelloExtensionType, ClientHelloGreasePlan, ClientHelloKeySharePlan,
-        ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension, ClientHelloRawExtensions,
-        ClientHelloSessionId, ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups,
-        ClientHelloSupportedVersions, FixedX25519KeyShare, ObservesX25519KeyShare,
+        ClientHelloExtensionType, ClientHelloForcedExtensions, ClientHelloGreaseExtension,
+        ClientHelloGreasePlan, ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan,
+        ClientHelloRawExtension, ClientHelloRawExtensions, ClientHelloSessionId,
+        ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups, ClientHelloSupportedVersions,
+        FixedX25519KeyShare, ObservesX25519KeyShare,
     };
     pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
     pub use handy::AlwaysResolvesClientRawPublicKeys;

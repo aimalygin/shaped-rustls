@@ -225,6 +225,51 @@ impl TryFrom<Vec<u16>> for ClientHelloExtensionPlan {
     }
 }
 
+/// Structured ClientHello controls for forcing known extensions to be emitted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClientHelloForcedExtensions {
+    renegotiation_info_empty: bool,
+    session_ticket_request: bool,
+    signed_certificate_timestamp_empty: bool,
+}
+
+impl ClientHelloForcedExtensions {
+    /// Create an empty forced-extension plan.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Emit renegotiation_info with an empty renegotiated_connection value.
+    pub fn with_renegotiation_info_empty(mut self) -> Self {
+        self.renegotiation_info_empty = true;
+        self
+    }
+
+    /// Emit an empty session_ticket request extension.
+    pub fn with_session_ticket_request(mut self) -> Self {
+        self.session_ticket_request = true;
+        self
+    }
+
+    /// Emit an empty signed_certificate_timestamp extension.
+    pub fn with_signed_certificate_timestamp_empty(mut self) -> Self {
+        self.signed_certificate_timestamp_empty = true;
+        self
+    }
+
+    pub(crate) fn renegotiation_info_empty(&self) -> bool {
+        self.renegotiation_info_empty
+    }
+
+    pub(crate) fn session_ticket_request(&self) -> bool {
+        self.session_ticket_request
+    }
+
+    pub(crate) fn signed_certificate_timestamp_empty(&self) -> bool {
+        self.signed_certificate_timestamp_empty
+    }
+}
+
 /// Explicit ALPN protocol list and order for the ClientHello.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHelloAlpnProtocols(Vec<Vec<u8>>);
@@ -587,12 +632,57 @@ impl TryFrom<Vec<ClientHelloRawExtension>> for ClientHelloRawExtensions {
     }
 }
 
+/// A GREASE extension entry for ClientHello shaping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloGreaseExtension {
+    value: u16,
+    position: usize,
+    payload: Vec<u8>,
+}
+
+impl ClientHelloGreaseExtension {
+    /// Create a GREASE extension using one of the RFC 8701 reserved values.
+    pub fn new(value: u16, position: usize, payload: Vec<u8>) -> Result<Self, Error> {
+        if !is_grease_value(value) {
+            return Err(Error::General(
+                "ClientHello GREASE extension value must be an RFC 8701 reserved value".into(),
+            ));
+        }
+        if payload.len() > usize::from(u16::MAX) {
+            return Err(Error::General(
+                "ClientHello GREASE extension payload cannot exceed 65535 bytes".into(),
+            ));
+        }
+
+        Ok(Self {
+            value,
+            position,
+            payload,
+        })
+    }
+
+    /// Return the GREASE extension type value.
+    pub fn value(&self) -> u16 {
+        self.value
+    }
+
+    /// Return the insertion position in the non-final extension order.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Return the GREASE extension body bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
 /// Explicit GREASE value and insertion positions for ClientHello shaping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHelloGreasePlan {
     value: u16,
     cipher_suite_position: Option<usize>,
-    extension_position: Option<usize>,
+    extensions: Vec<ClientHelloGreaseExtension>,
     supported_version_position: Option<usize>,
     supported_group_position: Option<usize>,
     key_share_position: Option<usize>,
@@ -610,14 +700,14 @@ impl ClientHelloGreasePlan {
         Ok(Self {
             value,
             cipher_suite_position: None,
-            extension_position: None,
+            extensions: Vec::new(),
             supported_version_position: None,
             supported_group_position: None,
             key_share_position: None,
         })
     }
 
-    /// Return the GREASE value used for every configured slot.
+    /// Return the GREASE value used by the simple GREASE insertion controls.
     pub fn value(&self) -> u16 {
         self.value
     }
@@ -630,8 +720,31 @@ impl ClientHelloGreasePlan {
 
     /// Insert the GREASE extension into the extension list at `position`.
     pub fn with_extension_position(mut self, position: usize) -> Self {
-        self.extension_position = Some(position);
+        self.extensions
+            .retain(|extension| extension.value() != self.value);
+        self.extensions
+            .push(ClientHelloGreaseExtension {
+                value: self.value,
+                position,
+                payload: Vec::new(),
+            });
         self
+    }
+
+    /// Insert a GREASE extension entry into the extension list.
+    pub fn with_extension(mut self, extension: ClientHelloGreaseExtension) -> Result<Self, Error> {
+        if self
+            .extensions
+            .iter()
+            .any(|existing| existing.value() == extension.value())
+        {
+            return Err(Error::General(
+                "ClientHello GREASE extensions contain a duplicate extension".into(),
+            ));
+        }
+
+        self.extensions.push(extension);
+        Ok(self)
     }
 
     /// Insert the GREASE value into supported_versions at `position`.
@@ -656,8 +769,8 @@ impl ClientHelloGreasePlan {
         self.cipher_suite_position
     }
 
-    pub(crate) fn extension_position(&self) -> Option<usize> {
-        self.extension_position
+    pub(crate) fn extensions(&self) -> &[ClientHelloGreaseExtension] {
+        &self.extensions
     }
 
     pub(crate) fn supported_version_position(&self) -> Option<usize> {
@@ -789,6 +902,7 @@ pub struct ClientHelloPlan {
     pub(crate) fixed_x25519: Option<FixedX25519KeyShare>,
     pub(crate) extension_order: Option<ClientHelloExtensionOrder>,
     pub(crate) extensions: Option<ClientHelloExtensionPlan>,
+    pub(crate) forced_extensions: Option<ClientHelloForcedExtensions>,
     pub(crate) alpn_protocols: Option<ClientHelloAlpnProtocols>,
     pub(crate) cipher_suites: Option<ClientHelloCipherSuites>,
     pub(crate) advertised_cipher_suites: Option<ClientHelloAdvertisedCipherSuites>,
@@ -845,6 +959,12 @@ impl ClientHelloPlan {
     /// Use structured ClientHello extension presence controls.
     pub fn with_extensions(mut self, extensions: ClientHelloExtensionPlan) -> Self {
         self.extensions = Some(extensions);
+        self
+    }
+
+    /// Use structured controls for forcing known ClientHello extensions.
+    pub fn with_forced_extensions(mut self, extensions: ClientHelloForcedExtensions) -> Self {
+        self.forced_extensions = Some(extensions);
         self
     }
 

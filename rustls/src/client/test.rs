@@ -11,10 +11,11 @@ use crate::client::{
     ClientConfig, ClientConnection, ClientHelloAdvertisedCipherSuites, ClientHelloAlpnProtocols,
     ClientHelloCertificateCompressionAlgorithms, ClientHelloCipherSuites, ClientHelloContext,
     ClientHelloCustomizer, ClientHelloExtensionOrder, ClientHelloExtensionPlan,
-    ClientHelloGreasePlan, ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan,
-    ClientHelloRawExtension, ClientHelloRawExtensions, ClientHelloSessionId,
-    ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups, ClientHelloSupportedVersions,
-    EchGreaseConfig, Resumption, Tls12Resumption,
+    ClientHelloForcedExtensions, ClientHelloGreaseExtension, ClientHelloGreasePlan,
+    ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension,
+    ClientHelloRawExtensions, ClientHelloSessionId, ClientHelloSignatureAlgorithms,
+    ClientHelloSupportedGroups, ClientHelloSupportedVersions, EchGreaseConfig, Resumption,
+    Tls12Resumption,
 };
 use crate::crypto::CryptoProvider;
 use crate::enums::{
@@ -780,6 +781,72 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_customizer_can_force_known_extensions() {
+        let forced = ClientHelloForcedExtensions::new()
+            .with_renegotiation_info_empty()
+            .with_session_ticket_request()
+            .with_signed_certificate_timestamp_empty();
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::RenegotiationInfo),
+            u16::from(ExtensionType::SessionTicket),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::SCT),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_forced_extensions(forced)
+                    .with_extension_order(order),
+            )),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        ClientHelloOracle::new()
+            .expect_extension_order(vec![
+                u16::from(ExtensionType::SupportedVersions),
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::SignatureAlgorithms),
+                u16::from(ExtensionType::EllipticCurves),
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::RenegotiationInfo),
+                u16::from(ExtensionType::SessionTicket),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::SCT),
+                u16::from(ExtensionType::KeyShare),
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+            ])
+            .expect_extension_body(
+                u16::from(ExtensionType::RenegotiationInfo),
+                ExpectedExtensionBody::Exact(vec![0]),
+            )
+            .expect_extension_body(
+                u16::from(ExtensionType::SessionTicket),
+                ExpectedExtensionBody::Exact(vec![]),
+            )
+            .expect_extension_body(
+                u16::from(ExtensionType::SCT),
+                ExpectedExtensionBody::Exact(vec![]),
+            )
+            .assert_matches_encoded(&encoded);
+    }
+
+    #[test]
     fn client_hello_customizer_can_insert_grease_values() {
         let grease = ClientHelloGreasePlan::new(0x0a0a)
             .unwrap()
@@ -819,6 +886,60 @@ mod tests {
             client_hello_extension_types_from_encoded(&encoded)[0],
             0x0a0a
         );
+    }
+
+    #[test]
+    fn client_hello_customizer_can_insert_multiple_grease_extensions_with_payloads() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 0, vec![]).unwrap())
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 4, vec![0]).unwrap())
+            .unwrap();
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_extension_order(order)
+                    .with_grease(grease),
+            )),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        ClientHelloOracle::new()
+            .expect_extension_order(vec![
+                0x0a0a,
+                u16::from(ExtensionType::SupportedVersions),
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::SignatureAlgorithms),
+                0x1a1a,
+                u16::from(ExtensionType::EllipticCurves),
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::KeyShare),
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+            ])
+            .expect_extension_body(0x0a0a, ExpectedExtensionBody::Exact(vec![]))
+            .expect_extension_body(0x1a1a, ExpectedExtensionBody::Exact(vec![0]))
+            .assert_matches_encoded(&encoded);
     }
 
     #[test]
@@ -966,6 +1087,179 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_oracle_can_place_forced_and_grease_extensions_before_padding() {
+        static BROTLI_DECOMPRESSOR: TestCertDecompressor =
+            TestCertDecompressor(CertificateCompressionAlgorithm::Brotli);
+
+        let advertised_cipher_suites = ClientHelloAdvertisedCipherSuites::try_from(vec![
+            CipherSuite::TLS13_AES_128_GCM_SHA256,
+            CipherSuite::TLS13_AES_256_GCM_SHA384,
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+            CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite::TLS_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+        ])
+        .unwrap();
+        let supported_versions = ClientHelloSupportedVersions::try_from(vec![
+            ProtocolVersion::TLSv1_3,
+            ProtocolVersion::TLSv1_2,
+        ])
+        .unwrap();
+        let supported_groups = ClientHelloSupportedGroups::try_from(vec![
+            NamedGroup::X25519,
+            NamedGroup::secp256r1,
+            NamedGroup::secp384r1,
+        ])
+        .unwrap();
+        let key_shares = ClientHelloKeySharePlan::try_from(vec![NamedGroup::X25519]).unwrap();
+        let signature_algorithms = ClientHelloSignatureAlgorithms::try_from(vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ])
+        .unwrap();
+        let alpn =
+            ClientHelloAlpnProtocols::try_from(vec![b"h2".to_vec(), b"http/1.1".to_vec()]).unwrap();
+        let compression = ClientHelloCertificateCompressionAlgorithms::try_from(vec![
+            CertificateCompressionAlgorithm::Brotli,
+        ])
+        .unwrap();
+        let raw_extensions = ClientHelloRawExtensions::try_from(vec![
+            ClientHelloRawExtension::new(0x4469, vec![0, 3, b'h', b'2', 0]).unwrap(),
+        ])
+        .unwrap();
+        let forced = ClientHelloForcedExtensions::new()
+            .with_renegotiation_info_empty()
+            .with_session_ticket_request()
+            .with_signed_certificate_timestamp_empty();
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_cipher_suite_position(0)
+            .with_supported_version_position(0)
+            .with_supported_group_position(0)
+            .with_key_share_position(0)
+            .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 0, vec![]).unwrap())
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 16, vec![0]).unwrap())
+            .unwrap();
+        let extension_order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::RenegotiationInfo),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::SessionTicket),
+            u16::from(ExtensionType::ALProtocolNegotiation),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::SCT),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::CompressCertificate),
+            0x4469,
+            u16::from(ExtensionType::Padding),
+        ])
+        .unwrap();
+        let padding = ClientHelloPaddingPlan::pad_to_handshake_size(512).unwrap();
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13, &version::TLS12])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.cert_decompressors = vec![&BROTLI_DECOMPRESSOR];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_advertised_cipher_suites(advertised_cipher_suites)
+                    .with_supported_versions(supported_versions)
+                    .with_supported_groups(supported_groups)
+                    .with_key_share_plan(key_shares)
+                    .with_signature_algorithms(signature_algorithms)
+                    .with_alpn_protocols(alpn)
+                    .with_certificate_compression_algorithms(compression)
+                    .with_raw_extensions(raw_extensions)
+                    .with_forced_extensions(forced)
+                    .with_grease(grease)
+                    .with_extension_order(extension_order)
+                    .with_padding(padding),
+            )),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        assert_eq!(encoded.len(), 512);
+        let padding_body =
+            client_hello_extension_body_from_encoded(&encoded, u16::from(ExtensionType::Padding))
+                .unwrap();
+        assert_eq!(padding_body.len(), 206);
+        assert!(
+            padding_body
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        ClientHelloOracle::new()
+            .expect_extension_order(vec![
+                0x0a0a,
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::RenegotiationInfo),
+                u16::from(ExtensionType::EllipticCurves),
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::SessionTicket),
+                u16::from(ExtensionType::ALProtocolNegotiation),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::SignatureAlgorithms),
+                u16::from(ExtensionType::SCT),
+                u16::from(ExtensionType::KeyShare),
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+                u16::from(ExtensionType::SupportedVersions),
+                u16::from(ExtensionType::CompressCertificate),
+                0x4469,
+                0x1a1a,
+                u16::from(ExtensionType::Padding),
+            ])
+            .expect_extension_body(0x0a0a, ExpectedExtensionBody::Exact(vec![]))
+            .expect_extension_body(
+                u16::from(ExtensionType::RenegotiationInfo),
+                ExpectedExtensionBody::Exact(vec![0]),
+            )
+            .expect_extension_body(
+                u16::from(ExtensionType::SessionTicket),
+                ExpectedExtensionBody::Exact(vec![]),
+            )
+            .expect_extension_body(
+                u16::from(ExtensionType::SCT),
+                ExpectedExtensionBody::Exact(vec![]),
+            )
+            .expect_extension_body(
+                0x4469,
+                ExpectedExtensionBody::Exact(vec![0, 3, b'h', b'2', 0]),
+            )
+            .expect_extension_body(0x1a1a, ExpectedExtensionBody::Exact(vec![0]))
+            .expect_extension_body(
+                u16::from(ExtensionType::Padding),
+                ExpectedExtensionBody::Exact(vec![0; 206]),
+            )
+            .assert_matches_encoded(&encoded);
+    }
+
+    #[test]
     fn client_hello_oracle_matches_complex_shaped_fingerprint_surface() {
         let raw_extension = ClientHelloRawExtension::new(0x1234, vec![1, 2, 3]).unwrap();
         let raw_extensions = ClientHelloRawExtensions::try_from(vec![raw_extension]).unwrap();
@@ -1063,10 +1357,52 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_grease_extension_rejects_non_grease_values() {
+        assert!(ClientHelloGreaseExtension::new(0x1234, 0, vec![]).is_err());
+    }
+
+    #[test]
+    fn client_hello_grease_plan_rejects_duplicate_extension_values() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 0, vec![]).unwrap())
+            .unwrap();
+
+        assert!(
+            grease
+                .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 1, vec![0]).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn client_hello_customizer_rejects_out_of_range_grease_position() {
         let grease = ClientHelloGreasePlan::new(0x0a0a)
             .unwrap()
             .with_supported_group_position(99);
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_grease(grease))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("GREASE position"));
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_out_of_range_grease_extension_position() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 99, vec![]).unwrap())
+            .unwrap();
         let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
             .with_protocol_versions(&[&version::TLS13])
             .unwrap()
