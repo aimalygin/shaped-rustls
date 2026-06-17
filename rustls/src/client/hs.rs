@@ -1109,12 +1109,17 @@ fn emit_client_hello_for_retry(
     }
 
     apply_alpn_plan(input.plan.as_ref(), &mut exts, &mut input.hello);
+    #[cfg(feature = "tls12")]
+    let require_ems = config.require_ems;
+    #[cfg(not(feature = "tls12"))]
+    let require_ems = false;
+
     apply_extension_plan(
         input.plan.as_ref(),
         &mut exts,
         &mut input.hello,
         &supported_versions,
-        config.require_ems,
+        require_ems,
     )?;
     apply_forced_extension_plan(input.plan.as_ref(), &mut exts);
     apply_raw_extension_plan(input.plan.as_ref(), &mut exts);
