@@ -14,8 +14,17 @@ use crate::sync::Arc;
 use crate::{Error, SupportedProtocolVersion};
 
 /// Builds an optional per-connection ClientHello customization plan.
+///
+/// This trait is the boundary between profile-specific code and rustls'
+/// generic ClientHello shaping primitives. Fingerprint registries should live
+/// outside rustls and translate their selected profile into a
+/// [`ClientHelloPlan`] for each connection.
 pub trait ClientHelloCustomizer: fmt::Debug + Send + Sync {
     /// Return `Ok(None)` to use upstream rustls ClientHello behavior.
+    ///
+    /// Returning `Ok(Some(ClientHelloPlan::new()))` is also a semantic no-op:
+    /// every unset field preserves the normal rustls default for that
+    /// connection.
     fn build_client_hello_plan(
         &self,
         context: ClientHelloContext<'_>,
@@ -37,9 +46,10 @@ pub struct ClientHelloContext<'a> {
     pub is_quic: bool,
 }
 
-/// Receives the exact encoded ClientHello handshake message.
+/// Receives the final encoded ClientHello handshake message.
 pub trait CapturesClientHello: fmt::Debug + Send + Sync {
-    /// Captures the encoded ClientHello handshake message.
+    /// Captures the encoded ClientHello handshake message after all selected
+    /// shaping controls have been applied.
     fn capture_client_hello(&self, bytes: &[u8]) -> Result<(), Error>;
 }
 
@@ -668,6 +678,11 @@ impl FixedX25519KeyShare {
 }
 
 /// Per-connection ClientHello customization plan.
+///
+/// Each field is independent and optional. Leaving a field unset preserves the
+/// rustls default for that aspect of the ClientHello, making an empty plan a
+/// no-op that is byte-shape compatible apart from rustls' normal per-connection
+/// randomness.
 #[derive(Clone, Debug, Default)]
 pub struct ClientHelloPlan {
     pub(crate) random: Option<[u8; 32]>,
@@ -691,6 +706,8 @@ pub struct ClientHelloPlan {
 
 impl ClientHelloPlan {
     /// Create an empty customization plan.
+    ///
+    /// An empty plan applies no shaping controls.
     pub fn new() -> Self {
         Self::default()
     }
@@ -707,7 +724,7 @@ impl ClientHelloPlan {
         self
     }
 
-    /// Capture the encoded ClientHello.
+    /// Capture the final encoded ClientHello.
     pub fn with_capture(mut self, capture: Arc<dyn CapturesClientHello>) -> Self {
         self.capture = Some(capture);
         self

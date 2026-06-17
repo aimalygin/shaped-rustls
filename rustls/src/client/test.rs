@@ -172,6 +172,44 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_noop_customizer_preserves_normalized_shape() {
+        let baseline = client_hello_shape_for_config(tls13_x25519_config_with_alpn())
+            .unwrap()
+            .with_sorted_extensions();
+        assert!(!baseline.extensions.is_empty());
+
+        let mut config = tls13_x25519_config_with_alpn();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(None),
+        }));
+
+        let customized = client_hello_shape_for_config(config)
+            .unwrap()
+            .with_sorted_extensions();
+
+        assert_eq!(customized, baseline);
+    }
+
+    #[test]
+    fn client_hello_empty_plan_preserves_normalized_shape() {
+        let baseline = client_hello_shape_for_config(tls13_x25519_config_with_alpn())
+            .unwrap()
+            .with_sorted_extensions();
+        assert!(!baseline.extensions.is_empty());
+
+        let mut config = tls13_x25519_config_with_alpn();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new())),
+        }));
+
+        let customized = client_hello_shape_for_config(config)
+            .unwrap()
+            .with_sorted_extensions();
+
+        assert_eq!(customized, baseline);
+    }
+
+    #[test]
     fn client_hello_customizer_can_fix_extension_order() {
         let order = ClientHelloExtensionOrder::try_from(vec![
             u16::from(ExtensionType::SupportedVersions),
@@ -1513,6 +1551,16 @@ mod tests {
         }
     }
 
+    fn tls13_x25519_config_with_alpn() -> ClientConfig {
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config
+    }
+
     #[cfg(feature = "aws_lc_rs")]
     fn aws_lc_x25519_provider() -> CryptoProvider {
         CryptoProvider {
@@ -1835,6 +1883,90 @@ impl crate::compress::CertDecompressor for TestCertDecompressor {
     fn algorithm(&self) -> CertificateCompressionAlgorithm {
         self.0
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClientHelloShape {
+    client_version: ProtocolVersion,
+    session_id_len: usize,
+    cipher_suites: Vec<CipherSuite>,
+    compression_methods: Vec<Compression>,
+    extensions: Vec<ClientHelloExtensionShape>,
+}
+
+impl ClientHelloShape {
+    fn with_sorted_extensions(mut self) -> Self {
+        self.extensions
+            .sort_by_key(|extension| extension.extension_type);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClientHelloExtensionShape {
+    extension_type: u16,
+    body: ClientHelloExtensionBodyShape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClientHelloExtensionBodyShape {
+    Exact(Vec<u8>),
+    KeyShare(Vec<(u16, usize)>),
+}
+
+fn client_hello_shape_for_config(config: ClientConfig) -> Result<ClientHelloShape, Error> {
+    let encoded = client_hello_encoded_bytes_for_config(config)?;
+    Ok(client_hello_shape_from_encoded(&encoded))
+}
+
+fn client_hello_shape_from_encoded(encoded: &[u8]) -> ClientHelloShape {
+    let ch = client_hello_from_encoded(encoded);
+    let extensions = client_hello_extensions_from_encoded(encoded)
+        .into_iter()
+        .map(|(extension_type, body)| ClientHelloExtensionShape {
+            extension_type,
+            body: client_hello_extension_body_shape(extension_type, body),
+        })
+        .collect();
+
+    ClientHelloShape {
+        client_version: ch.client_version,
+        session_id_len: ch.session_id.as_ref().len(),
+        cipher_suites: ch.cipher_suites,
+        compression_methods: ch.compression_methods,
+        extensions,
+    }
+}
+
+fn client_hello_extension_body_shape(
+    extension_type: u16,
+    body: Vec<u8>,
+) -> ClientHelloExtensionBodyShape {
+    match ExtensionType::from(extension_type) {
+        ExtensionType::KeyShare => ClientHelloExtensionBodyShape::KeyShare(key_share_shape(&body)),
+        _ => ClientHelloExtensionBodyShape::Exact(body),
+    }
+}
+
+fn key_share_shape(body: &[u8]) -> Vec<(u16, usize)> {
+    let mut offset = 0;
+    assert!(body.len() >= 2);
+    let key_shares_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2;
+    assert_eq!(key_shares_len, body.len() - offset);
+
+    let mut entries = Vec::new();
+    while offset < body.len() {
+        assert!(body.len() >= offset + 4);
+        let group = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let payload_len = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
+        offset += 4;
+        assert!(body.len() >= offset + payload_len);
+        entries.push((group, payload_len));
+        offset += payload_len;
+    }
+
+    entries
 }
 
 fn client_hello_encoded_bytes_for_config(config: ClientConfig) -> Result<Vec<u8>, Error> {
