@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+
+"""
+Compare the default ClientHello emitted by this checkout against upstream rustls.
+
+The check builds a tiny external crate against:
+
+* an upstream rustls snapshot from a git ref, and
+* the rustls crate in this checkout.
+
+It then emits a default ClientHello through rustls' public API and compares the
+wire image after normalizing fields that are expected to vary:
+
+* client_random
+* session_id
+* key_share public key bytes
+
+Extension order, extension payloads, cipher suites, versions, key share groups,
+and all lengths remain byte-for-byte comparable.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+CASES = [
+    ("ring_tls13_only", ["ring"]),
+    ("ring_tls12_tls13", ["ring", "tls12"]),
+    ("aws_lc_rs_tls13_only", ["aws_lc_rs"]),
+    ("aws_lc_rs_tls12_tls13", ["aws_lc_rs", "tls12"]),
+]
+
+HARNESS_MAIN = r"""
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore};
+
+#[derive(Debug)]
+struct DeterministicRandom;
+
+static DETERMINISTIC_RANDOM: DeterministicRandom = DeterministicRandom;
+
+impl rustls::crypto::SecureRandom for DeterministicRandom {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        for (index, byte) in buf.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "ring", not(feature = "aws_lc_rs")))]
+fn provider() -> CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+#[cfg(all(feature = "aws_lc_rs", not(feature = "ring")))]
+fn provider() -> CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
+fn main() {
+    let mut provider = provider();
+    provider.secure_random = &DETERMINISTIC_RANDOM;
+
+    let config = ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap()).unwrap();
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+
+    for byte in bytes {
+        print!("{byte:02x}");
+    }
+    println!();
+}
+"""
+
+
+def run(args, *, cwd=None, env=None, stdout=None):
+    return subprocess.run(
+        args,
+        cwd=cwd,
+        env=env,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        text=False,
+        check=True,
+    )
+
+
+def repo_root():
+    result = run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE)
+    return Path(result.stdout.decode().strip())
+
+
+def default_upstream_ref(root):
+    cargo_toml = root / "rustls" / "Cargo.toml"
+    text = cargo_toml.read_text(encoding="utf-8")
+    match = re.search(r'(?m)^version = "([^"]+)"$', text)
+    if not match:
+        raise ValueError(f"could not find rustls version in {cargo_toml}")
+    return f"v/{match.group(1)}"
+
+
+def ensure_git_ref(root, ref):
+    run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=root, stdout=subprocess.PIPE)
+
+
+def extract_ref(root, ref, destination):
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.Popen(
+        ["git", "archive", "--format=tar", ref],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert archive.stdout is not None
+    with tarfile.open(fileobj=archive.stdout, mode="r|") as tar:
+        tar.extractall(destination)
+    stderr = archive.stderr.read() if archive.stderr is not None else b""
+    if archive.wait() != 0:
+        raise subprocess.CalledProcessError(archive.returncode, archive.args, stderr=stderr)
+
+
+def write_harness(path, package_name, rustls_path):
+    src = path / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    (path / "Cargo.toml").write_text(
+        f"""[package]
+name = "{package_name}"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+ring = ["rustls/ring"]
+aws_lc_rs = ["rustls/aws_lc_rs"]
+tls12 = ["rustls/tls12"]
+
+[dependencies]
+rustls = {{ path = "{rustls_path}", default-features = false, features = ["std"] }}
+""",
+        encoding="utf-8",
+    )
+    (src / "main.rs").write_text(HARNESS_MAIN, encoding="utf-8")
+
+
+def run_harness(manifest, features, *, root, offline):
+    env = dict(os.environ)
+    if offline:
+        env["CARGO_NET_OFFLINE"] = "true"
+    result = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "--quiet",
+            "--manifest-path",
+            str(manifest),
+            "--features",
+            ",".join(features),
+        ],
+        cwd=root,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        raise SystemExit(result.returncode)
+    return bytes.fromhex(result.stdout.strip())
+
+
+def normalize_client_hello(record):
+    data = bytearray(record)
+    if len(data) < 9 or data[0] != 0x16:
+        raise ValueError("not a TLS handshake record")
+    if data[5] != 0x01:
+        raise ValueError("not a ClientHello")
+
+    body = 5 + 4
+    offset = body + 2
+    data[offset : offset + 32] = b"\0" * 32
+    offset += 32
+
+    session_id_len = data[offset]
+    offset += 1
+    data[offset : offset + session_id_len] = b"\0" * session_id_len
+    offset += session_id_len
+
+    cipher_suites_len = int.from_bytes(data[offset : offset + 2], "big")
+    offset += 2 + cipher_suites_len
+
+    compression_methods_len = data[offset]
+    offset += 1 + compression_methods_len
+
+    extensions_len = int.from_bytes(data[offset : offset + 2], "big")
+    offset += 2
+    extensions_end = offset + extensions_len
+
+    while offset < extensions_end:
+        extension_type = int.from_bytes(data[offset : offset + 2], "big")
+        extension_len = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        extension_body = offset + 4
+        if extension_type == 0x0033:
+            normalize_key_share(data, extension_body, extension_body + extension_len)
+        offset = extension_body + extension_len
+
+    if offset != extensions_end:
+        raise ValueError("invalid ClientHello extension vector")
+
+    return bytes(data)
+
+
+def normalize_key_share(data, start, end):
+    offset = start
+    vector_len = int.from_bytes(data[offset : offset + 2], "big")
+    offset += 2
+    if offset + vector_len != end:
+        raise ValueError("invalid key_share length")
+    while offset < end:
+        offset += 2
+        key_exchange_len = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+        data[offset : offset + key_exchange_len] = b"\0" * key_exchange_len
+        offset += key_exchange_len
+
+
+def extension_order(record):
+    data = record
+    offset = 5 + 4 + 2 + 32
+    session_id_len = data[offset]
+    offset += 1 + session_id_len
+    cipher_suites_len = int.from_bytes(data[offset : offset + 2], "big")
+    offset += 2 + cipher_suites_len
+    compression_methods_len = data[offset]
+    offset += 1 + compression_methods_len
+    extensions_len = int.from_bytes(data[offset : offset + 2], "big")
+    offset += 2
+    extensions_end = offset + extensions_len
+
+    order = []
+    while offset < extensions_end:
+        extension_type = int.from_bytes(data[offset : offset + 2], "big")
+        extension_len = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        order.append(f"0x{extension_type:04x}")
+        offset += 4 + extension_len
+    return order
+
+
+def first_diff(left, right):
+    for index, (left_byte, right_byte) in enumerate(zip(left, right)):
+        if left_byte != right_byte:
+            return index, left_byte, right_byte
+    if len(left) != len(right):
+        return min(len(left), len(right)), None, None
+    return None
+
+
+def compare_case(name, features, upstream_manifest, fork_manifest, *, root, offline):
+    upstream = run_harness(upstream_manifest, features, root=root, offline=offline)
+    fork = run_harness(fork_manifest, features, root=root, offline=offline)
+    normalized_upstream = normalize_client_hello(upstream)
+    normalized_fork = normalize_client_hello(fork)
+    raw_equal = upstream == fork
+    normalized_equal = normalized_upstream == normalized_fork
+
+    print(f"{name}: raw_equal={str(raw_equal).lower()} normalized_equal={str(normalized_equal).lower()}")
+    print(f"{name}: upstream_len={len(upstream)} fork_len={len(fork)}")
+    print(f"{name}: upstream_extensions={' '.join(extension_order(upstream))}")
+    print(f"{name}: fork_extensions={' '.join(extension_order(fork))}")
+
+    if not normalized_equal:
+        diff = first_diff(normalized_upstream, normalized_fork)
+        if diff is not None:
+            index, upstream_byte, fork_byte = diff
+            print(
+                f"{name}: first_normalized_diff={index} "
+                f"upstream={upstream_byte!r} fork={fork_byte!r}"
+            )
+        return False
+    return True
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--upstream-ref",
+        help="git ref for upstream rustls; default is v/<rustls Cargo.toml version>",
+    )
+    parser.add_argument(
+        "--tmpdir",
+        help="directory for generated upstream snapshot and harnesses",
+    )
+    parser.add_argument(
+        "--keep-tmp",
+        action="store_true",
+        help="keep generated temporary files after the check",
+    )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="allow Cargo to access the network; by default CARGO_NET_OFFLINE=true is used",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    root = repo_root()
+    upstream_ref = args.upstream_ref or default_upstream_ref(root)
+    ensure_git_ref(root, upstream_ref)
+
+    temp_root = Path(args.tmpdir) if args.tmpdir else Path(tempfile.mkdtemp(prefix="rustls-clienthello-compat."))
+    if args.tmpdir:
+        temp_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        upstream_root = temp_root / "upstream"
+        harness_upstream = temp_root / "harness-upstream"
+        harness_fork = temp_root / "harness-fork"
+
+        if upstream_root.exists():
+            shutil.rmtree(upstream_root)
+        if harness_upstream.exists():
+            shutil.rmtree(harness_upstream)
+        if harness_fork.exists():
+            shutil.rmtree(harness_fork)
+
+        extract_ref(root, upstream_ref, upstream_root)
+        write_harness(harness_upstream, "rustls-clienthello-compat-upstream", upstream_root / "rustls")
+        write_harness(harness_fork, "rustls-clienthello-compat-fork", root / "rustls")
+
+        print(f"upstream_ref={upstream_ref}")
+        print(f"tmpdir={temp_root}")
+        print(f"cargo_offline={str(not args.online).lower()}")
+
+        ok = True
+        for name, features in CASES:
+            ok = compare_case(
+                name,
+                features,
+                harness_upstream / "Cargo.toml",
+                harness_fork / "Cargo.toml",
+                root=root,
+                offline=not args.online,
+            ) and ok
+
+        if not ok:
+            return 1
+        print("clienthello_compat=ok")
+        return 0
+    finally:
+        if args.keep_tmp or args.tmpdir:
+            print(f"kept_tmpdir={temp_root}")
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
