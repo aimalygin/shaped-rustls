@@ -37,6 +37,7 @@ pub(crate) mod ticketer;
 #[cfg(feature = "tls12")]
 pub(crate) mod tls12;
 pub(crate) mod tls13;
+pub(crate) mod x25519;
 
 /// A `CryptoProvider` backed by aws-lc-rs.
 pub fn default_provider() -> CryptoProvider {

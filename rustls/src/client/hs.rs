@@ -208,6 +208,7 @@ impl ClientHelloInput {
                 &self.config,
                 &self.server_name,
                 &mut cx.common.kx_state,
+                self.plan.as_ref(),
             )?)
         } else {
             None
@@ -1060,6 +1061,20 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         let key_share = match hrr.key_share {
             Some(group) if group != offered_key_share.group() => {
+                if self
+                    .next
+                    .input
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.fixed_x25519.as_ref())
+                    .is_some()
+                {
+                    return Err(Error::General(
+                        "fixed X25519 key share cannot be retried with a different X25519 group"
+                            .into(),
+                    ));
+                }
+
                 let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
                     return Err(cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,

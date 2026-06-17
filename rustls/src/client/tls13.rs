@@ -10,7 +10,7 @@ use super::hs::{ClientContext, ClientHelloInput, ClientSessionValue};
 use crate::check::inappropriate_handshake_message;
 use crate::client::common::{ClientAuthDetails, ClientHelloDetails, ServerCertDetails};
 use crate::client::ech::{self, EchState, EchStatus};
-use crate::client::{ClientConfig, ClientSessionStore, hs};
+use crate::client::{ClientConfig, ClientHelloPlan, ClientSessionStore, hs};
 use crate::common_state::{
     CommonState, HandshakeFlightTls13, HandshakeKind, KxState, Protocol, Side, State,
 };
@@ -27,7 +27,7 @@ use crate::log::{debug, trace, warn};
 use crate::msgs::base::{Payload, PayloadU8};
 use crate::msgs::ccs::ChangeCipherSpecPayload;
 use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::enums::{ExtensionType, KeyUpdateRequest};
+use crate::msgs::enums::{ExtensionType, KeyUpdateRequest, NamedGroup};
 use crate::msgs::handshake::{
     CERTIFICATE_MAX_SIZE_LIMIT, CertificatePayloadTls13, ClientExtensions, EchConfigPayload,
     HandshakeMessagePayload, HandshakePayload, KeyShareEntry, NewSessionTicketPayloadTls13,
@@ -310,6 +310,7 @@ pub(super) fn initial_key_share(
     config: &ClientConfig,
     server_name: &ServerName<'_>,
     kx_state: &mut KxState,
+    plan: Option<&ClientHelloPlan>,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
     let group = config
         .resumption
@@ -325,6 +326,48 @@ pub(super) fn initial_key_share(
                 .next()
                 .expect("No kx groups configured")
         });
+
+    if plan
+        .and_then(|plan| plan.fixed_x25519.as_ref())
+        .is_some()
+    {
+        if group.name() != NamedGroup::X25519 {
+            return Err(Error::General(
+                "fixed X25519 key share requires X25519 to be the selected group".into(),
+            ));
+        }
+
+        #[cfg(feature = "aws_lc_rs")]
+        {
+            if !core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519) {
+                return Err(Error::General(
+                    "fixed X25519 key share requires aws-lc X25519 to be the selected group".into(),
+                ));
+            }
+
+            let fixed_x25519 = plan
+                .and_then(|plan| plan.fixed_x25519.as_ref())
+                .expect("fixed_x25519 checked above");
+            let key_exchange =
+                crypto::aws_lc_rs::x25519::start_fixed_x25519(fixed_x25519.private_key())?;
+            let public_key: &[u8; 32] = key_exchange
+                .pub_key()
+                .try_into()
+                .map_err(|_| Error::General("fixed X25519 public key was not 32 bytes".into()))?;
+            if let Some(observer) = fixed_x25519.observer() {
+                observer.observe_x25519_key_share(public_key)?;
+            }
+            *kx_state = KxState::Start(group);
+            return Ok(key_exchange);
+        }
+
+        #[cfg(not(feature = "aws_lc_rs"))]
+        {
+            return Err(Error::General(
+                "fixed X25519 key share requires the aws_lc_rs feature".into(),
+            ));
+        }
+    }
 
     *kx_state = KxState::Start(group);
     group.start()

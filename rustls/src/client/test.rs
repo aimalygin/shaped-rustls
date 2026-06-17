@@ -286,7 +286,11 @@ mod tests {
         let err = ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
             .unwrap_err();
 
-        assert!(matches!(err, Error::General(message) if message.contains("X25519")));
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("X25519"));
+        assert!(message.contains("aws_lc_rs") || message.contains("aws-lc"));
     }
 
     #[test]
@@ -981,11 +985,13 @@ impl crate::client::CapturesClientHello for RecordingClientHelloCapture {
     }
 }
 
+#[cfg(feature = "aws_lc_rs")]
 #[derive(Debug)]
 struct RecordingX25519KeyShare {
     public_key: StdArc<Mutex<Option<[u8; 32]>>>,
 }
 
+#[cfg(feature = "aws_lc_rs")]
 impl crate::client::ObservesX25519KeyShare for RecordingX25519KeyShare {
     fn observe_x25519_key_share(&self, public_key: &[u8; 32]) -> Result<(), Error> {
         *self.public_key.lock().unwrap() = Some(*public_key);
