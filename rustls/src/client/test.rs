@@ -718,6 +718,98 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_oracle_matches_complex_shaped_fingerprint_surface() {
+        let raw_extension = ClientHelloRawExtension::new(0x1234, vec![1, 2, 3]).unwrap();
+        let raw_extensions = ClientHelloRawExtensions::try_from(vec![raw_extension]).unwrap();
+        let extension_order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            0x1234,
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+            u16::from(ExtensionType::Padding),
+        ])
+        .unwrap();
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_cipher_suite_position(0)
+            .with_supported_version_position(0)
+            .with_supported_group_position(0)
+            .with_key_share_position(0)
+            .with_extension_position(0);
+        let cipher_suites = ClientHelloCipherSuites::try_from(vec![
+            CipherSuite::TLS13_AES_128_GCM_SHA256,
+            CipherSuite::TLS13_AES_256_GCM_SHA384,
+        ])
+        .unwrap();
+        let padding = ClientHelloPaddingPlan::fixed(4).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_cipher_suites(cipher_suites)
+                    .with_raw_extensions(raw_extensions)
+                    .with_extension_order(extension_order)
+                    .with_grease(grease)
+                    .with_padding(padding),
+            )),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        ClientHelloOracle::new()
+            .expect_client_version(ProtocolVersion::TLSv1_2)
+            .expect_session_id_len(32)
+            .expect_cipher_suites(vec![
+                CipherSuite::from(0x0a0a),
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                CipherSuite::TLS13_AES_256_GCM_SHA384,
+            ])
+            .expect_compression_methods(vec![Compression::Null])
+            .expect_extension_order(vec![
+                0x0a0a,
+                u16::from(ExtensionType::SupportedVersions),
+                0x1234,
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::SignatureAlgorithms),
+                u16::from(ExtensionType::EllipticCurves),
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::KeyShare),
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+                u16::from(ExtensionType::Padding),
+            ])
+            .expect_extension_body(
+                u16::from(ExtensionType::SupportedVersions),
+                ExpectedExtensionBody::Exact(vec![4, 0x0a, 0x0a, 0x03, 0x04]),
+            )
+            .expect_extension_body(
+                u16::from(ExtensionType::EllipticCurves),
+                ExpectedExtensionBody::Exact(vec![0, 4, 0x0a, 0x0a, 0x00, 0x1d]),
+            )
+            .expect_extension_body(
+                u16::from(ExtensionType::KeyShare),
+                ExpectedExtensionBody::KeyShare(vec![(0x0a0a, 1), (0x001d, 32)]),
+            )
+            .expect_extension_body(0x1234, ExpectedExtensionBody::Exact(vec![1, 2, 3]))
+            .expect_extension_body(
+                u16::from(ExtensionType::Padding),
+                ExpectedExtensionBody::Exact(vec![0, 0, 0, 0]),
+            )
+            .assert_matches_encoded(&encoded);
+    }
+
+    #[test]
     fn client_hello_grease_plan_rejects_non_grease_values() {
         assert!(ClientHelloGreasePlan::new(0x1234).is_err());
     }
@@ -1902,10 +1994,115 @@ impl ClientHelloShape {
     }
 }
 
+#[derive(Default)]
+struct ClientHelloOracle {
+    client_version: Option<ProtocolVersion>,
+    session_id_len: Option<usize>,
+    cipher_suites: Option<Vec<CipherSuite>>,
+    compression_methods: Option<Vec<Compression>>,
+    extension_order: Option<Vec<u16>>,
+    extension_bodies: Vec<(u16, ExpectedExtensionBody)>,
+}
+
+impl ClientHelloOracle {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn expect_client_version(mut self, version: ProtocolVersion) -> Self {
+        self.client_version = Some(version);
+        self
+    }
+
+    fn expect_session_id_len(mut self, len: usize) -> Self {
+        self.session_id_len = Some(len);
+        self
+    }
+
+    fn expect_cipher_suites(mut self, cipher_suites: Vec<CipherSuite>) -> Self {
+        self.cipher_suites = Some(cipher_suites);
+        self
+    }
+
+    fn expect_compression_methods(mut self, methods: Vec<Compression>) -> Self {
+        self.compression_methods = Some(methods);
+        self
+    }
+
+    fn expect_extension_order(mut self, order: Vec<u16>) -> Self {
+        self.extension_order = Some(order);
+        self
+    }
+
+    fn expect_extension_body(mut self, extension_type: u16, body: ExpectedExtensionBody) -> Self {
+        self.extension_bodies
+            .push((extension_type, body));
+        self
+    }
+
+    fn assert_matches_encoded(self, encoded: &[u8]) {
+        let shape = client_hello_shape_from_encoded(encoded);
+
+        if let Some(expected) = self.client_version {
+            assert_eq!(shape.client_version, expected, "ClientHello legacy_version");
+        }
+        if let Some(expected) = self.session_id_len {
+            assert_eq!(shape.session_id_len, expected, "ClientHello session_id len");
+        }
+        if let Some(expected) = self.cipher_suites {
+            assert_eq!(shape.cipher_suites, expected, "ClientHello cipher_suites");
+        }
+        if let Some(expected) = self.compression_methods {
+            assert_eq!(
+                shape.compression_methods, expected,
+                "ClientHello compression_methods"
+            );
+        }
+        if let Some(expected) = self.extension_order {
+            let actual = shape
+                .extensions
+                .iter()
+                .map(|extension| extension.extension_type)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "ClientHello extension order");
+        }
+
+        for (expected_type, expected_body) in self.extension_bodies {
+            let actual = shape
+                .extensions
+                .iter()
+                .find(|extension| extension.extension_type == expected_type)
+                .unwrap_or_else(|| {
+                    panic!("ClientHello extension 0x{expected_type:04x} was not emitted")
+                });
+            assert_eq!(
+                actual.body,
+                expected_body.into_shape(),
+                "ClientHello extension 0x{expected_type:04x} body"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ClientHelloExtensionShape {
     extension_type: u16,
     body: ClientHelloExtensionBodyShape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedExtensionBody {
+    Exact(Vec<u8>),
+    KeyShare(Vec<(u16, usize)>),
+}
+
+impl ExpectedExtensionBody {
+    fn into_shape(self) -> ClientHelloExtensionBodyShape {
+        match self {
+            Self::Exact(body) => ClientHelloExtensionBodyShape::Exact(body),
+            Self::KeyShare(entries) => ClientHelloExtensionBodyShape::KeyShare(entries),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
