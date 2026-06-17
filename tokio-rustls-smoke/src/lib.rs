@@ -3,11 +3,11 @@ mod tests {
     use std::io;
     use std::sync::Arc;
 
-    use rcgen::{generate_simple_self_signed, CertifiedKey};
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
     };
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use rustls::{ClientConfig, DigitallySignedStruct, Error, ServerConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -57,9 +57,7 @@ mod tests {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_chain = vec![CertificateDer::from(cert.der().to_vec())];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            signing_key.serialize_der(),
-        ));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
 
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
@@ -76,9 +74,15 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(4096);
 
         let server = tokio::spawn(async move {
-            let mut stream = acceptor.accept(server_io).await.unwrap();
+            let mut stream = acceptor
+                .accept(server_io)
+                .await
+                .unwrap();
             let mut request = [0u8; 4];
-            stream.read_exact(&mut request).await.unwrap();
+            stream
+                .read_exact(&mut request)
+                .await
+                .unwrap();
             assert_eq!(&request, b"ping");
             stream.write_all(b"pong").await.unwrap();
         });
@@ -89,7 +93,10 @@ mod tests {
             .unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut response = [0u8; 4];
-        client.read_exact(&mut response).await.unwrap();
+        client
+            .read_exact(&mut response)
+            .await
+            .unwrap();
         assert_eq!(&response, b"pong");
 
         server.await.unwrap();

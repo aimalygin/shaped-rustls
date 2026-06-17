@@ -132,10 +132,9 @@ mod tests {
                 .with_root_certificates(roots())
                 .with_no_client_auth();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
-            plan: Mutex::new(Some(
-                ClientHelloPlan::new()
-                    .with_session_id(ClientHelloSessionId::try_from(session_id.clone()).unwrap()),
-            )),
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_session_id(
+                ClientHelloSessionId::try_from(session_id.clone()).unwrap(),
+            ))),
         }));
 
         let ch = client_hello_sent_for_config(config).unwrap();
@@ -363,15 +362,13 @@ mod tests {
             .with_root_certificates(roots())
             .with_no_client_auth();
         client_config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
-            plan: Mutex::new(Some(
-                ClientHelloPlan::new().with_fixed_x25519(
-                    crate::client::FixedX25519KeyShare::new(private_key).with_observer(
-                        StdArc::new(RecordingX25519KeyShare {
-                            public_key: observed_public.clone(),
-                        }),
-                    ),
-                ),
-            )),
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_fixed_x25519(
+                crate::client::FixedX25519KeyShare::new(private_key).with_observer(StdArc::new(
+                    RecordingX25519KeyShare {
+                        public_key: observed_public.clone(),
+                    },
+                )),
+            ))),
         }));
         let server_config = ServerConfig::builder_with_provider(provider.into())
             .with_protocol_versions(&[&version::TLS13])
