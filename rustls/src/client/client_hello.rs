@@ -19,6 +19,59 @@ use crate::{Error, SupportedProtocolVersion};
 /// generic ClientHello shaping primitives. Fingerprint registries should live
 /// outside rustls and translate their selected profile into a
 /// [`ClientHelloPlan`] for each connection.
+///
+/// ```
+/// use rustls::client::{
+///     ClientHelloCipherSuites, ClientHelloContext, ClientHelloCustomizer, ClientHelloGreasePlan,
+///     ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension,
+///     ClientHelloRawExtensions, ClientHelloSupportedGroups, ClientHelloSupportedVersions,
+/// };
+/// use rustls::{CipherSuite, Error, NamedGroup, ProtocolVersion};
+///
+/// #[derive(Debug)]
+/// struct RegistryBackedCustomizer;
+///
+/// impl ClientHelloCustomizer for RegistryBackedCustomizer {
+///     fn build_client_hello_plan(
+///         &self,
+///         context: ClientHelloContext<'_>,
+///     ) -> Result<Option<ClientHelloPlan>, Error> {
+///         // Profile names and registry lookup live outside rustls. The selected
+///         // profile is translated into generic ClientHello controls here.
+///         if context.is_quic {
+///             return Ok(None);
+///         }
+///
+///         let raw_extensions = ClientHelloRawExtensions::try_from(vec![
+///             ClientHelloRawExtension::new(0x1234, vec![1, 2, 3])?,
+///         ])?;
+///
+///         let plan = ClientHelloPlan::new()
+///             .with_cipher_suites(ClientHelloCipherSuites::try_from(vec![
+///                 CipherSuite::TLS13_AES_128_GCM_SHA256,
+///                 CipherSuite::TLS13_AES_256_GCM_SHA384,
+///             ])?)
+///             .with_supported_versions(ClientHelloSupportedVersions::try_from(vec![
+///                 ProtocolVersion::TLSv1_3,
+///             ])?)
+///             .with_supported_groups(ClientHelloSupportedGroups::try_from(vec![
+///                 NamedGroup::X25519,
+///             ])?)
+///             .with_key_share_plan(ClientHelloKeySharePlan::try_from(vec![
+///                 NamedGroup::X25519,
+///             ])?)
+///             .with_grease(
+///                 ClientHelloGreasePlan::new(0x0a0a)?
+///                     .with_cipher_suite_position(0)
+///                     .with_extension_position(0),
+///             )
+///             .with_raw_extensions(raw_extensions)
+///             .with_padding(ClientHelloPaddingPlan::fixed(8)?);
+///
+///         Ok(Some(plan))
+///     }
+/// }
+/// ```
 pub trait ClientHelloCustomizer: fmt::Debug + Send + Sync {
     /// Return `Ok(None)` to use upstream rustls ClientHello behavior.
     ///
@@ -47,6 +100,11 @@ pub struct ClientHelloContext<'a> {
 }
 
 /// Receives the final encoded ClientHello handshake message.
+///
+/// The captured bytes are the encoded TLS handshake message, including its
+/// handshake header and excluding any record-layer header. This is intended for
+/// downstream fixture/oracle comparison; it does not change the ClientHello by
+/// itself.
 pub trait CapturesClientHello: fmt::Debug + Send + Sync {
     /// Captures the encoded ClientHello handshake message after all selected
     /// shaping controls have been applied.
@@ -407,6 +465,10 @@ impl TryFrom<Vec<CertificateCompressionAlgorithm>> for ClientHelloCertificateCom
 }
 
 /// A bounded raw unknown ClientHello extension.
+///
+/// This escape hatch is only for extension types rustls does not know about.
+/// Use the structured ClientHello controls for known extensions; GREASE
+/// extensions are handled by [`ClientHelloGreasePlan`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHelloRawExtension {
     extension_type: ClientHelloExtensionType,
