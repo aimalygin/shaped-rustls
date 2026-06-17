@@ -43,9 +43,10 @@ normal handshake behavior must match upstream.
 
 ## Recommended Approach
 
-Start a branch from upstream `rustls v0.23.40`, for example `xray/v0.23`.
-Port only the brief and design work needed for this fork onto that baseline.
-Then implement Milestone 1 and Milestone 2 in order.
+Start from upstream `rustls v0.23.40`. For this implementation, the user
+approved working directly in `main`: `main` now starts from `v/0.23.40`, and
+the previous tip is preserved at `backup/main-before-xray-v0.23`. Implement
+Milestone 1 and Milestone 2 in order from this baseline.
 
 This avoids building a prototype on `0.24.0-dev.0` that would have to be
 reconciled with the `0.23.x` API line targeted by `tokio-rustls 0.26.4`.
@@ -118,7 +119,7 @@ REALITY surface.
 
 Tasks:
 
-- Create the maintained branch from upstream `rustls v0.23.40`.
+- Use the maintained `main` baseline from upstream `rustls v0.23.40`.
 - Keep `rustls/Cargo.toml` package name as `rustls`.
 - Add the optional `ClientHelloCustomizer` field to `ClientConfig`.
 - Add `ClientHelloContext` and `ClientHelloPlan` with random, session id, and

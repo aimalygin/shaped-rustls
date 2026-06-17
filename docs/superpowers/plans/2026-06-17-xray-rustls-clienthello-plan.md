@@ -61,27 +61,39 @@ printf '%s\n%s\n' "$DESIGN_COMMIT" "$PLAN_COMMIT"
 
 Expected: two non-empty commit hashes.
 
-- [ ] **Step 3: Create the implementation branch from upstream rustls 0.23.40**
+- [x] **Step 3: Use the approved `main` baseline from upstream rustls 0.23.40**
 
-Run:
+The user approved working directly in `main`. Current `main` has been reset to
+`v/0.23.40`, and the previous `main` tip is preserved at
+`backup/main-before-xray-v0.23`.
 
-```bash
-git switch -c xray/v0.23 v/0.23.40
-```
-
-Expected: branch `xray/v0.23` is created from `v/0.23.40`. `rustls/Cargo.toml` says `version = "0.23.40"` and `package.name = "rustls"`.
-
-- [ ] **Step 4: Carry the design and plan docs onto the branch**
-
-Run:
+Verify:
 
 ```bash
-git cherry-pick "$DESIGN_COMMIT" "$PLAN_COMMIT"
+git rev-parse --abbrev-ref HEAD
+git rev-parse HEAD~2
+git rev-parse v/0.23.40
+git rev-parse backup/main-before-xray-v0.23
 ```
 
-Expected: the two docs commits apply cleanly.
+Expected: branch is `main`, `HEAD~2` equals `v/0.23.40`, the backup branch
+exists, and `rustls/Cargo.toml` says `version = "0.23.40"` and package
+`name = "rustls"`.
 
-- [ ] **Step 5: Commit checkpoint**
+- [x] **Step 4: Carry the design and plan docs onto `main`**
+
+Already done by cherry-picking the design and plan commits onto the `main`
+baseline.
+
+Verify:
+
+```bash
+git log --oneline -3
+```
+
+Expected: the two docs commits are present above `Prepare 0.23.40`.
+
+- [x] **Step 5: Commit checkpoint**
 
 No new commit is needed here if the cherry-picks created commits. Run:
 
