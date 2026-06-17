@@ -1,0 +1,11 @@
+[package]
+name = "tokio-rustls-smoke"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rcgen = { workspace = true }
+rustls = { path = "../rustls" }
+tokio = { version = "1.52.3", features = ["io-util", "macros", "rt"] }
+tokio-rustls = "0.26.4"
