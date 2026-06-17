@@ -5,6 +5,7 @@ use core::{fmt, mem};
 
 use pki_types::{ServerName, UnixTime};
 
+use super::client_hello::ClientHelloCustomizer;
 use super::handy::NoClientSessionStorage;
 use super::hs::{self, ClientHelloInput};
 #[cfg(feature = "std")]
@@ -165,6 +166,11 @@ pub struct ClientConfig {
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
+
+    /// Optional generic ClientHello customizer.
+    ///
+    /// If this is `None`, rustls emits the same ClientHello it would emit upstream.
+    pub client_hello_customizer: Option<Arc<dyn ClientHelloCustomizer>>,
 
     /// Whether to check the selected ALPN was offered.
     ///
@@ -395,6 +401,11 @@ impl ClientConfig {
     /// Return the crypto provider used to construct this client configuration.
     pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
         &self.provider
+    }
+
+    /// Return the configured ClientHello customizer, if any.
+    pub fn client_hello_customizer(&self) -> Option<&Arc<dyn ClientHelloCustomizer>> {
+        self.client_hello_customizer.as_ref()
     }
 
     /// Access configuration options whose use is dangerous and requires

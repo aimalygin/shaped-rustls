@@ -582,6 +582,7 @@ pub use crate::webpki::RootCertStore;
 pub mod client {
     pub(super) mod builder;
     mod client_conn;
+    mod client_hello;
     mod common;
     mod ech;
     pub(super) mod handy;
@@ -599,6 +600,11 @@ pub mod client {
     };
     #[cfg(feature = "std")]
     pub use client_conn::{ClientConnection, WriteEarlyData};
+    pub use client_hello::{
+        CapturesClientHello, ClientHelloContext, ClientHelloCustomizer, ClientHelloExtensionOrder,
+        ClientHelloExtensionType, ClientHelloPlan, ClientHelloSessionId, FixedX25519KeyShare,
+        ObservesX25519KeyShare,
+    };
     pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
     pub use handy::AlwaysResolvesClientRawPublicKeys;
     #[cfg(any(feature = "std", feature = "hashbrown"))]
