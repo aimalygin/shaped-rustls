@@ -16,7 +16,7 @@ use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
+use crate::client::{ClientConfig, ClientHelloContext, ClientHelloPlan, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -39,6 +39,7 @@ use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
+use crate::versions;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
@@ -74,6 +75,7 @@ pub(super) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) server_name: ServerName<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+    pub(super) plan: Option<ClientHelloPlan>,
 }
 
 impl ClientHelloInput {
@@ -124,14 +126,65 @@ impl ClientHelloInput {
             crate::rand::random_u16(config.provider.secure_random)?,
         );
 
+        let plan = match config.client_hello_customizer.as_ref() {
+            Some(customizer) => {
+                let forbids_tls12 = cx.common.is_quic() || config.ech_mode.is_some();
+                let versions: Vec<_> = versions::ALL_VERSIONS
+                    .iter()
+                    .copied()
+                    .filter(|version| match version.version {
+                        ProtocolVersion::TLSv1_2 => {
+                            !forbids_tls12 && config.supports_version(ProtocolVersion::TLSv1_2)
+                        }
+                        ProtocolVersion::TLSv1_3 => {
+                            config.supports_version(ProtocolVersion::TLSv1_3)
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                let alpn_protocols: Vec<_> = extra_exts
+                    .protocols
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|protocol| protocol.as_ref().to_vec())
+                    .collect();
+
+                customizer.build_client_hello_plan(ClientHelloContext {
+                    server_name: &server_name,
+                    alpn_protocols: &alpn_protocols,
+                    versions: &versions,
+                    crypto_provider: &config.provider,
+                    is_quic: cx.common.is_quic(),
+                })?
+            }
+            None => None,
+        };
+
+        let random = plan
+            .as_ref()
+            .and_then(|plan| plan.random)
+            .map(Random::from)
+            .unwrap_or(Random::new(config.provider.secure_random)?);
+
+        let session_id = match plan
+            .as_ref()
+            .and_then(|plan| plan.session_id.as_ref())
+        {
+            Some(custom_session_id) => SessionId::from_bytes(custom_session_id.as_slice())
+                .map_err(|_| Error::General("invalid ClientHello session id".into()))?,
+            None => session_id,
+        };
+
         Ok(Self {
             resuming,
-            random: Random::new(config.provider.secure_random)?,
+            random,
             sent_tls13_fake_ccs: false,
             hello,
             session_id,
             server_name,
             prev_ech_ext: None,
+            plan,
             config,
         })
     }
@@ -459,6 +512,16 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
+
+    if let Some(capture) = input
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.capture.as_ref())
+    {
+        let mut bytes = Vec::new();
+        ch.payload.encode(&mut bytes);
+        capture.capture_client_hello(&bytes)?;
+    }
 
     if retryreq.is_some() {
         // send dummy CCS to fool middleboxes prior

@@ -173,6 +173,19 @@ impl SessionId {
         Ok(Self { data, len: 32 })
     }
 
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, InvalidMessage> {
+        if bytes.len() > 32 {
+            return Err(InvalidMessage::TrailingData("SessionID"));
+        }
+
+        let mut data = [0u8; 32];
+        data[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            len: bytes.len(),
+            data,
+        })
+    }
+
     pub(crate) fn empty() -> Self {
         Self {
             data: [0u8; 32],

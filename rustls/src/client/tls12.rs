@@ -92,6 +92,7 @@ mod server_hello {
             let ClientHelloInput {
                 config,
                 server_name,
+                plan: _,
                 ..
             } = self.input;
 
