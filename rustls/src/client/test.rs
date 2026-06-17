@@ -8,13 +8,20 @@ use std::sync::{Arc as StdArc, Mutex};
 use pki_types::{CertificateDer, ServerName};
 
 use crate::client::{
-    ClientConfig, ClientConnection, ClientHelloContext, ClientHelloCustomizer,
-    ClientHelloExtensionOrder, ClientHelloPlan, ClientHelloSessionId, Resumption, Tls12Resumption,
+    ClientConfig, ClientConnection, ClientHelloAlpnProtocols,
+    ClientHelloCertificateCompressionAlgorithms, ClientHelloCipherSuites, ClientHelloContext,
+    ClientHelloCustomizer, ClientHelloExtensionOrder, ClientHelloExtensionPlan,
+    ClientHelloGreasePlan, ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan,
+    ClientHelloRawExtension, ClientHelloRawExtensions, ClientHelloSessionId,
+    ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups, ClientHelloSupportedVersions,
+    Resumption, Tls12Resumption,
 };
 use crate::crypto::CryptoProvider;
-use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+use crate::enums::{
+    CertificateCompressionAlgorithm, CipherSuite, ProtocolVersion, SignatureScheme,
+};
 use crate::msgs::base::PayloadU16;
-use crate::msgs::codec::Reader;
+use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     ClientExtensions, ClientHelloPayload, EncryptedClientHello, HandshakeMessagePayload,
@@ -204,6 +211,691 @@ mod tests {
                 ExtensionType::PSKKeyExchangeModes,
             ]
         );
+    }
+
+    #[test]
+    fn client_hello_customizer_can_set_cipher_suites() {
+        let cipher_suites = ClientHelloCipherSuites::try_from(vec![
+            CipherSuite::TLS13_AES_128_GCM_SHA256,
+            CipherSuite::TLS13_AES_256_GCM_SHA384,
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_cipher_suites(cipher_suites),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(
+            ch.cipher_suites,
+            vec![
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                CipherSuite::TLS13_AES_256_GCM_SHA384,
+            ]
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_unsupported_cipher_suite() {
+        let cipher_suites =
+            ClientHelloCipherSuites::try_from(vec![CipherSuite::TLS13_AES_128_CCM_8_SHA256])
+                .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_cipher_suites(cipher_suites),
+            )),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("cipher suite"));
+    }
+
+    #[test]
+    fn client_hello_customizer_can_set_supported_versions() {
+        let versions = ClientHelloSupportedVersions::try_from(vec![
+            ProtocolVersion::TLSv1_2,
+            ProtocolVersion::TLSv1_3,
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13, &version::TLS12])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_supported_versions(versions),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+        let versions = ch
+            .extensions
+            .supported_versions
+            .unwrap();
+
+        assert_eq!(
+            versions.as_slice(),
+            &[ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3]
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_unsupported_supported_version() {
+        let versions =
+            ClientHelloSupportedVersions::try_from(vec![ProtocolVersion::TLSv1_2]).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_supported_versions(versions),
+            )),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("supported version"));
+    }
+
+    #[test]
+    fn client_hello_customizer_can_set_supported_groups() {
+        let groups =
+            ClientHelloSupportedGroups::try_from(vec![NamedGroup::secp256r1, NamedGroup::X25519])
+                .unwrap();
+        let provider = CryptoProvider {
+            kx_groups: vec![
+                super::provider::kx_group::X25519,
+                super::provider::kx_group::SECP256R1,
+            ],
+            ..super::provider::default_provider()
+        };
+        let mut config = ClientConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_supported_groups(groups))),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(
+            ch.extensions.named_groups.unwrap(),
+            vec![NamedGroup::secp256r1, NamedGroup::X25519]
+        );
+        assert_eq!(
+            ch.extensions.key_shares.unwrap()[0].group,
+            NamedGroup::secp256r1
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_unsupported_supported_group() {
+        let groups = ClientHelloSupportedGroups::try_from(vec![NamedGroup::secp256r1]).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_supported_groups(groups))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("supported group"));
+    }
+
+    #[test]
+    fn client_hello_customizer_can_set_signature_algorithms() {
+        let signature_algorithms = ClientHelloSignatureAlgorithms::try_from(vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_signature_algorithms(signature_algorithms),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(
+            ch.extensions.signature_schemes.unwrap(),
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+            ]
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_unsupported_signature_algorithm() {
+        let signature_algorithms =
+            ClientHelloSignatureAlgorithms::try_from(vec![SignatureScheme::RSA_PKCS1_SHA1])
+                .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_signature_algorithms(signature_algorithms),
+            )),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("signature algorithm"));
+    }
+
+    #[test]
+    fn client_hello_customizer_can_set_certificate_compression_algorithms() {
+        static ZLIB_DECOMPRESSOR: TestCertDecompressor =
+            TestCertDecompressor(CertificateCompressionAlgorithm::Zlib);
+        static BROTLI_DECOMPRESSOR: TestCertDecompressor =
+            TestCertDecompressor(CertificateCompressionAlgorithm::Brotli);
+
+        let algorithms = ClientHelloCertificateCompressionAlgorithms::try_from(vec![
+            CertificateCompressionAlgorithm::Brotli,
+            CertificateCompressionAlgorithm::Zlib,
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.cert_decompressors = vec![&ZLIB_DECOMPRESSOR, &BROTLI_DECOMPRESSOR];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_certificate_compression_algorithms(algorithms),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(
+            ch.extensions
+                .certificate_compression_algorithms
+                .unwrap(),
+            vec![
+                CertificateCompressionAlgorithm::Brotli,
+                CertificateCompressionAlgorithm::Zlib,
+            ]
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_unsupported_certificate_compression_algorithm() {
+        let algorithms = ClientHelloCertificateCompressionAlgorithms::try_from(vec![
+            CertificateCompressionAlgorithm::Zlib,
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.cert_decompressors.clear();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_certificate_compression_algorithms(algorithms),
+            )),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("certificate compression"));
+    }
+
+    #[test]
+    fn client_hello_customizer_can_set_alpn_protocols() {
+        let alpn =
+            ClientHelloAlpnProtocols::try_from(vec![b"http/1.1".to_vec(), b"h2".to_vec()]).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_alpn_protocols(alpn))),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+        let protocols = ch.extensions.protocols.unwrap();
+
+        assert_eq!(protocols[0].as_ref(), b"http/1.1");
+        assert_eq!(protocols[1].as_ref(), b"h2");
+    }
+
+    #[test]
+    fn client_hello_alpn_protocols_rejects_empty_protocol_name() {
+        assert!(ClientHelloAlpnProtocols::try_from(vec![Vec::new()]).is_err());
+    }
+
+    #[test]
+    fn client_hello_customizer_can_disable_optional_extensions() {
+        let disabled = vec![
+            ExtensionType::ServerName,
+            ExtensionType::StatusRequest,
+            ExtensionType::ALProtocolNegotiation,
+            ExtensionType::ExtendedMasterSecret,
+            ExtensionType::ECPointFormats,
+            ExtensionType::PSKKeyExchangeModes,
+            ExtensionType::CompressCertificate,
+        ];
+        let extensions = ClientHelloExtensionPlan::try_from(
+            disabled
+                .iter()
+                .map(|ext| u16::from(*ext))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_extensions(extensions))),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+        let used_extensions = ch
+            .extensions
+            .used_extensions_in_encoding_order();
+
+        for extension in disabled {
+            assert!(
+                !used_extensions.contains(&extension),
+                "{extension:?} was still emitted"
+            );
+        }
+        assert!(ch.extensions.server_name.is_none());
+        assert!(
+            ch.extensions
+                .certificate_status_request
+                .is_none()
+        );
+        assert!(ch.extensions.protocols.is_none());
+        assert!(
+            ch.extensions
+                .extended_master_secret_request
+                .is_none()
+        );
+        assert!(ch.extensions.ec_point_formats.is_none());
+        assert!(
+            ch.extensions
+                .preshared_key_modes
+                .is_none()
+        );
+        assert!(
+            ch.extensions
+                .certificate_compression_algorithms
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_disabling_required_extension() {
+        let extensions =
+            ClientHelloExtensionPlan::try_from(vec![u16::from(ExtensionType::SupportedVersions)])
+                .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_extensions(extensions))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("required extension"));
+    }
+
+    #[test]
+    fn client_hello_extension_plan_rejects_duplicate_disabled_extension() {
+        assert!(
+            ClientHelloExtensionPlan::try_from(vec![
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::ServerName),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_can_insert_grease_values() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_cipher_suite_position(0)
+            .with_supported_group_position(0)
+            .with_key_share_position(0)
+            .with_extension_position(0);
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_grease(grease))),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+        let ch = client_hello_from_encoded(&encoded);
+
+        assert_eq!(ch.cipher_suites[0], CipherSuite::from(0x0a0a));
+        assert_eq!(
+            ch.extensions
+                .named_groups
+                .as_ref()
+                .unwrap()[0],
+            NamedGroup::from(0x0a0a)
+        );
+        assert_eq!(
+            ch.extensions
+                .key_shares
+                .as_ref()
+                .unwrap()[0]
+                .group,
+            NamedGroup::from(0x0a0a)
+        );
+        assert_eq!(
+            client_hello_extension_types_from_encoded(&encoded)[0],
+            0x0a0a
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_can_insert_supported_versions_grease() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_supported_version_position(0);
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_grease(grease))),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        assert_eq!(
+            client_hello_extension_body_from_encoded(
+                &encoded,
+                u16::from(ExtensionType::SupportedVersions),
+            )
+            .unwrap(),
+            vec![4, 0x0a, 0x0a, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn client_hello_grease_plan_rejects_non_grease_values() {
+        assert!(ClientHelloGreasePlan::new(0x1234).is_err());
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_out_of_range_grease_position() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_supported_group_position(99);
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_grease(grease))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("GREASE position"));
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_out_of_range_supported_versions_grease_position() {
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_supported_version_position(99);
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_grease(grease))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("GREASE position"));
+    }
+
+    #[cfg(all(
+        feature = "aws-lc-rs",
+        feature = "prefer-post-quantum",
+        not(feature = "fips")
+    ))]
+    #[test]
+    fn client_hello_customizer_can_set_key_share_groups() {
+        let key_shares =
+            ClientHelloKeySharePlan::try_from(vec![NamedGroup::X25519, NamedGroup::X25519MLKEM768])
+                .unwrap();
+        let mut config = ClientConfig::builder_with_provider(
+            crate::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_protocol_versions(&[&version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_key_share_plan(key_shares))),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+        let key_shares = ch.extensions.key_shares.unwrap();
+
+        assert_eq!(key_shares.len(), 2);
+        assert_eq!(key_shares[0].group, NamedGroup::X25519);
+        assert_eq!(key_shares[1].group, NamedGroup::X25519MLKEM768);
+    }
+
+    #[test]
+    fn client_hello_customizer_rejects_unsupported_key_share_group() {
+        let key_shares = ClientHelloKeySharePlan::try_from(vec![NamedGroup::secp256r1]).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_key_share_plan(key_shares))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("key share"));
+    }
+
+    #[test]
+    fn client_hello_key_share_plan_rejects_duplicate_groups() {
+        assert!(
+            ClientHelloKeySharePlan::try_from(vec![NamedGroup::X25519, NamedGroup::X25519])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_can_add_fixed_padding() {
+        let padding = ClientHelloPaddingPlan::fixed(16).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_padding(padding))),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+        let ch = client_hello_from_encoded(&encoded);
+
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, u16::from(ExtensionType::Padding))
+                .unwrap(),
+            vec![0u8; 16]
+        );
+        assert!(
+            ch.extensions
+                .used_extensions_in_encoding_order()
+                .contains(&ExtensionType::Padding)
+        );
+    }
+
+    #[test]
+    fn client_hello_customizer_can_pad_to_handshake_size() {
+        let base_len = client_hello_encoded_bytes_for_config(
+            ClientConfig::builder_with_provider(x25519_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth(),
+        )
+        .unwrap()
+        .len();
+        let target_len = base_len + 32;
+        let padding = ClientHelloPaddingPlan::pad_to_handshake_size(target_len).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_padding(padding))),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+        let padding =
+            client_hello_extension_body_from_encoded(&encoded, u16::from(ExtensionType::Padding))
+                .unwrap();
+
+        assert_eq!(encoded.len(), target_len);
+        assert!(padding.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn client_hello_customizer_padding_rejects_oversized_fixed_length() {
+        assert!(ClientHelloPaddingPlan::fixed(u16::MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn client_hello_customizer_can_add_raw_unknown_extension() {
+        let raw_extension = ClientHelloRawExtension::new(0x1234, vec![1, 2, 3]).unwrap();
+        let raw_extensions = ClientHelloRawExtensions::try_from(vec![raw_extension]).unwrap();
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            0x1234,
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_raw_extensions(raw_extensions)
+                    .with_extension_order(order),
+            )),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        assert_eq!(
+            client_hello_extension_types_from_encoded(&encoded)[1],
+            0x1234
+        );
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x1234).unwrap(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn client_hello_raw_extension_rejects_known_and_grease_types() {
+        assert!(
+            ClientHelloRawExtension::new(u16::from(ExtensionType::ServerName), Vec::new()).is_err()
+        );
+        assert!(ClientHelloRawExtension::new(0x0a0a, Vec::new()).is_err());
     }
 
     #[test]
@@ -1128,6 +1820,23 @@ impl crate::client::ObservesX25519KeyShare for RecordingX25519KeyShare {
     }
 }
 
+#[derive(Debug)]
+struct TestCertDecompressor(CertificateCompressionAlgorithm);
+
+impl crate::compress::CertDecompressor for TestCertDecompressor {
+    fn decompress(
+        &self,
+        _input: &[u8],
+        _output: &mut [u8],
+    ) -> Result<(), crate::compress::DecompressionFailed> {
+        Ok(())
+    }
+
+    fn algorithm(&self) -> CertificateCompressionAlgorithm {
+        self.0
+    }
+}
+
 fn client_hello_encoded_bytes_for_config(config: ClientConfig) -> Result<Vec<u8>, Error> {
     let mut conn =
         ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
@@ -1145,6 +1854,59 @@ fn client_hello_encoded_bytes_for_config(config: ClientConfig) -> Result<Vec<u8>
         } => Ok(encoded.into_vec()),
         other => panic!("unexpected message {other:?}"),
     }
+}
+
+fn client_hello_from_encoded(encoded: &[u8]) -> ClientHelloPayload {
+    let message = HandshakeMessagePayload::read(&mut Reader::init(encoded)).unwrap();
+
+    match message.0 {
+        HandshakePayload::ClientHello(ch) => ch,
+        other => panic!("unexpected handshake payload {other:?}"),
+    }
+}
+
+fn client_hello_extension_types_from_encoded(encoded: &[u8]) -> Vec<u16> {
+    client_hello_extensions_from_encoded(encoded)
+        .into_iter()
+        .map(|(extension_type, _)| extension_type)
+        .collect()
+}
+
+fn client_hello_extension_body_from_encoded(
+    encoded: &[u8],
+    extension_type: u16,
+) -> Option<Vec<u8>> {
+    client_hello_extensions_from_encoded(encoded)
+        .into_iter()
+        .find_map(|(typ, body)| (typ == extension_type).then_some(body))
+}
+
+fn client_hello_extensions_from_encoded(encoded: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let body = &encoded[4..];
+    let mut offset = 2 + 32;
+    let session_id_len = body[offset] as usize;
+    offset += 1 + session_id_len;
+    let cipher_suites_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2 + cipher_suites_len;
+    let compression_methods_len = body[offset] as usize;
+    offset += 1 + compression_methods_len;
+    let extensions_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    offset += 2;
+
+    let extensions_end = offset + extensions_len;
+    let mut extensions = Vec::new();
+    while offset < extensions_end {
+        let extension_type = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let extension_len = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
+        offset += 4;
+        extensions.push((
+            extension_type,
+            body[offset..offset + extension_len].to_vec(),
+        ));
+        offset += extension_len;
+    }
+
+    extensions
 }
 
 fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {

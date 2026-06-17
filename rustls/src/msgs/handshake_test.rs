@@ -782,10 +782,7 @@ fn sample_client_hello_payload() -> ClientHelloPayload {
             ec_point_formats: Some(SupportedEcPointFormats::default()),
             named_groups: Some(vec![NamedGroup::X25519]),
             protocols: Some(vec![ProtocolName::from(vec![0])]),
-            supported_versions: Some(SupportedProtocolVersions {
-                tls13: true,
-                ..Default::default()
-            }),
+            supported_versions: Some(SupportedProtocolVersions::from_flags(false, true)),
             key_shares: Some(vec![KeyShareEntry::new(NamedGroup::X25519, &[1, 2, 3][..])]),
             preshared_key_modes: Some(PskKeyExchangeModes {
                 psk_dhe: true,

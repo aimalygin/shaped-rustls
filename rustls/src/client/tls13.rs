@@ -17,7 +17,7 @@ use crate::common_state::{
 use crate::conn::ConnectionRandoms;
 use crate::conn::kernel::{Direction, KernelContext, KernelState};
 use crate::crypto::hash::Hash;
-use crate::crypto::{ActiveKeyExchange, SharedSecret};
+use crate::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
 use crate::enums::{
     AlertDescription, ContentType, HandshakeType, ProtocolVersion, SignatureScheme,
 };
@@ -74,7 +74,7 @@ pub(super) fn handle_server_hello(
     suite: &'static Tls13CipherSuite,
     mut transcript: HandshakeHash,
     early_data_key_schedule: Option<KeyScheduleEarly>,
-    our_key_share: Box<dyn ActiveKeyExchange>,
+    our_key_shares: OfferedKeyShares,
     server_hello_msg: &Message<'_>,
     ech_state: Option<EchState>,
     input: ClientHelloInput,
@@ -108,7 +108,7 @@ pub(super) fn handle_server_hello(
         _ => None,
     };
 
-    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
+    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_shares, their_key_share)
         .map_err(|_| {
             cx.common.send_fatal_alert(
                 AlertDescription::IllegalParameter,
@@ -259,29 +259,38 @@ impl KeyExchangeChoice {
     fn new(
         config: &Arc<ClientConfig>,
         cx: &mut ClientContext<'_>,
-        our_key_share: Box<dyn ActiveKeyExchange>,
+        our_key_shares: OfferedKeyShares,
         their_key_share: &KeyShareEntry,
     ) -> Result<Self, ()> {
-        if our_key_share.group() == their_key_share.group {
-            return Ok(Self::Whole(our_key_share));
-        }
-
-        let (component_group, _) = our_key_share
-            .hybrid_component()
-            .ok_or(())?;
-
-        if component_group != their_key_share.group {
+        if !our_key_shares.contains_group(their_key_share.group) {
             return Err(());
         }
 
-        // correct the record for the benefit of accuracy of
-        // `negotiated_key_exchange_group()`
-        let actual_skxg = config
-            .find_kx_group(component_group, ProtocolVersion::TLSv1_3)
-            .ok_or(())?;
-        cx.common.kx_state = KxState::Start(actual_skxg);
+        for key_share in our_key_shares.exchanges {
+            if key_share.group() == their_key_share.group {
+                let actual_skxg = config
+                    .find_kx_group(their_key_share.group, ProtocolVersion::TLSv1_3)
+                    .ok_or(())?;
+                cx.common.kx_state = KxState::Start(actual_skxg);
+                return Ok(Self::Whole(key_share));
+            }
 
-        Ok(Self::Component(our_key_share))
+            let Some((component_group, _)) = key_share.hybrid_component() else {
+                continue;
+            };
+
+            if component_group == their_key_share.group {
+                // correct the record for the benefit of accuracy of
+                // `negotiated_key_exchange_group()`
+                let actual_skxg = config
+                    .find_kx_group(component_group, ProtocolVersion::TLSv1_3)
+                    .ok_or(())?;
+                cx.common.kx_state = KxState::Start(actual_skxg);
+                return Ok(Self::Component(key_share));
+            }
+        }
+
+        Err(())
     }
 
     fn complete(self, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
@@ -306,17 +315,86 @@ fn validate_server_hello(
     Ok(())
 }
 
-pub(super) fn initial_key_share(
+pub(super) struct OfferedKeyShares {
+    exchanges: Vec<Box<dyn ActiveKeyExchange>>,
+    offered_groups: Vec<NamedGroup>,
+}
+
+impl OfferedKeyShares {
+    pub(super) fn key_share_entries(&self) -> Result<Vec<KeyShareEntry>, Error> {
+        self.offered_groups
+            .iter()
+            .map(|group| {
+                let Some(payload) = self.payload_for(*group) else {
+                    return Err(Error::General(
+                        "ClientHello key share group is unavailable".into(),
+                    ));
+                };
+                Ok(KeyShareEntry::new(*group, payload))
+            })
+            .collect()
+    }
+
+    pub(super) fn contains_group(&self, group: NamedGroup) -> bool {
+        self.offered_groups.contains(&group)
+    }
+
+    fn payload_for(&self, group: NamedGroup) -> Option<&[u8]> {
+        for key_share in &self.exchanges {
+            if key_share.group() == group {
+                return Some(key_share.pub_key());
+            }
+            if let Some((component_group, component_share)) = key_share.hybrid_component() {
+                if component_group == group {
+                    return Some(component_share);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn covers_group(&self, group: NamedGroup) -> bool {
+        self.payload_for(group).is_some()
+    }
+}
+
+pub(super) fn initial_key_shares(
     config: &ClientConfig,
     server_name: &ServerName<'_>,
     kx_state: &mut KxState,
     plan: Option<&ClientHelloPlan>,
-) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-    let group = config
-        .resumption
-        .store
-        .kx_hint(server_name)
-        .and_then(|group_name| config.find_kx_group(group_name, ProtocolVersion::TLSv1_3))
+) -> Result<OfferedKeyShares, Error> {
+    if let Some(key_share_plan) = plan.and_then(|plan| plan.key_share_plan.as_ref()) {
+        return planned_key_shares(config, kx_state, plan, key_share_plan.as_slice());
+    }
+
+    let planned_group = match plan.and_then(|plan| plan.supported_groups.as_ref()) {
+        Some(groups) => {
+            let mut selected = None;
+            for group_name in groups.as_slice() {
+                let Some(group) = config.find_kx_group(*group_name, ProtocolVersion::TLSv1_3)
+                else {
+                    return Err(Error::General(
+                        "ClientHello supported group is not supported by this config".into(),
+                    ));
+                };
+                selected = Some(group);
+                break;
+            }
+            selected
+        }
+        None => None,
+    };
+
+    let group = planned_group
+        .or_else(|| {
+            config
+                .resumption
+                .store
+                .kx_hint(server_name)
+                .and_then(|group_name| config.find_kx_group(group_name, ProtocolVersion::TLSv1_3))
+        })
         .unwrap_or_else(|| {
             config
                 .provider
@@ -327,50 +405,177 @@ pub(super) fn initial_key_share(
                 .expect("No kx groups configured")
         });
 
-    if plan
-        .and_then(|plan| plan.fixed_x25519.as_ref())
-        .is_some()
+    let key_exchange = start_key_exchange_for_group(config, group.name(), plan)?;
+    *kx_state = KxState::Start(group);
+    let mut offered_groups = vec![key_exchange.group()];
+    if let Some((component_group, _)) = key_exchange
+        .hybrid_component()
+        .filter(|(group, _)| {
+            config
+                .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+                .is_some()
+        })
     {
-        if group.name() != NamedGroup::X25519 {
+        offered_groups.push(component_group);
+    }
+
+    Ok(OfferedKeyShares {
+        exchanges: vec![key_exchange],
+        offered_groups,
+    })
+}
+
+pub(super) fn retry_key_share(
+    config: &ClientConfig,
+    group: NamedGroup,
+    kx_state: &mut KxState,
+) -> Result<OfferedKeyShares, Error> {
+    let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
+        return Err(Error::General(
+            "ClientHello key share group is not supported by this config".into(),
+        ));
+    };
+
+    *kx_state = KxState::Start(skxg);
+    Ok(OfferedKeyShares {
+        exchanges: vec![skxg.start()?],
+        offered_groups: vec![group],
+    })
+}
+
+fn planned_key_shares(
+    config: &ClientConfig,
+    kx_state: &mut KxState,
+    plan: Option<&ClientHelloPlan>,
+    groups: &[NamedGroup],
+) -> Result<OfferedKeyShares, Error> {
+    if let Some(fixed_x25519) = plan.and_then(|plan| plan.fixed_x25519.as_ref()) {
+        if groups != [NamedGroup::X25519] {
             return Err(Error::General(
-                "fixed X25519 key share requires X25519 to be the selected group".into(),
+                "fixed X25519 key share requires a single X25519 key_share group".into(),
             ));
         }
+        let group = config
+            .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
+            .ok_or_else(|| {
+                Error::General("ClientHello key share group is not supported by this config".into())
+            })?;
+        let key_exchange = start_fixed_x25519_key_share(group, fixed_x25519)?;
+        *kx_state = KxState::Start(group);
+        return Ok(OfferedKeyShares {
+            exchanges: vec![key_exchange],
+            offered_groups: groups.to_vec(),
+        });
+    }
 
-        #[cfg(feature = "aws_lc_rs")]
-        {
-            if !core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519) {
+    if let Some(supported_groups) = plan.and_then(|plan| plan.supported_groups.as_ref()) {
+        for group in groups {
+            if !supported_groups
+                .as_slice()
+                .contains(group)
+            {
                 return Err(Error::General(
-                    "fixed X25519 key share requires aws-lc X25519 to be the selected group".into(),
+                    "ClientHello key share group must also be present in supported_groups".into(),
                 ));
             }
-
-            let fixed_x25519 = plan
-                .and_then(|plan| plan.fixed_x25519.as_ref())
-                .expect("fixed_x25519 checked above");
-            let key_exchange =
-                crypto::aws_lc_rs::x25519::start_fixed_x25519(fixed_x25519.private_key())?;
-            let public_key: &[u8; 32] = key_exchange
-                .pub_key()
-                .try_into()
-                .map_err(|_| Error::General("fixed X25519 public key was not 32 bytes".into()))?;
-            if let Some(observer) = fixed_x25519.observer() {
-                observer.observe_x25519_key_share(public_key)?;
-            }
-            *kx_state = KxState::Start(group);
-            return Ok(key_exchange);
-        }
-
-        #[cfg(not(feature = "aws_lc_rs"))]
-        {
-            return Err(Error::General(
-                "fixed X25519 key share requires the aws_lc_rs feature".into(),
-            ));
         }
     }
 
-    *kx_state = KxState::Start(group);
+    let mut offered = OfferedKeyShares {
+        exchanges: Vec::new(),
+        offered_groups: groups.to_vec(),
+    };
+
+    for group in groups {
+        if offered.covers_group(*group) {
+            continue;
+        }
+        let key_exchange = start_key_exchange_for_named_group(config, *group)?;
+        offered.exchanges.push(key_exchange);
+    }
+
+    let first_group = offered
+        .exchanges
+        .first()
+        .map(|key_share| key_share.group())
+        .ok_or_else(|| Error::General("ClientHello key share plan cannot be empty".into()))?;
+    let first_kx_group = config
+        .find_kx_group(first_group, ProtocolVersion::TLSv1_3)
+        .ok_or_else(|| {
+            Error::General("ClientHello key share group is not supported by this config".into())
+        })?;
+    *kx_state = KxState::Start(first_kx_group);
+    Ok(offered)
+}
+
+fn start_key_exchange_for_named_group(
+    config: &ClientConfig,
+    group: NamedGroup,
+) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    let Some(group) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
+        return Err(Error::General(
+            "ClientHello key share group is not supported by this config".into(),
+        ));
+    };
+
     group.start()
+}
+
+fn start_key_exchange_for_group(
+    config: &ClientConfig,
+    group: NamedGroup,
+    plan: Option<&ClientHelloPlan>,
+) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    if let Some(fixed_x25519) = plan.and_then(|plan| plan.fixed_x25519.as_ref()) {
+        let group = config
+            .find_kx_group(group, ProtocolVersion::TLSv1_3)
+            .ok_or_else(|| {
+                Error::General("ClientHello key share group is not supported by this config".into())
+            })?;
+        return start_fixed_x25519_key_share(group, fixed_x25519);
+    }
+
+    start_key_exchange_for_named_group(config, group)
+}
+
+fn start_fixed_x25519_key_share(
+    group: &'static dyn SupportedKxGroup,
+    fixed_x25519: &crate::client::FixedX25519KeyShare,
+) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    if group.name() != NamedGroup::X25519 {
+        return Err(Error::General(
+            "fixed X25519 key share requires X25519 to be the selected group".into(),
+        ));
+    }
+
+    #[cfg(feature = "aws_lc_rs")]
+    {
+        if !core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519) {
+            return Err(Error::General(
+                "fixed X25519 key share requires aws-lc X25519 to be the selected group".into(),
+            ));
+        }
+
+        let key_exchange =
+            crypto::aws_lc_rs::x25519::start_fixed_x25519(fixed_x25519.private_key())?;
+        let public_key: &[u8; 32] = key_exchange
+            .pub_key()
+            .try_into()
+            .map_err(|_| Error::General("fixed X25519 public key was not 32 bytes".into()))?;
+        if let Some(observer) = fixed_x25519.observer() {
+            observer.observe_x25519_key_share(public_key)?;
+        }
+        Ok(key_exchange)
+    }
+
+    #[cfg(not(feature = "aws_lc_rs"))]
+    {
+        let _ = group;
+        let _ = fixed_x25519;
+        Err(Error::General(
+            "fixed X25519 key share requires the aws_lc_rs feature".into(),
+        ))
+    }
 }
 
 /// This implements the horrifying TLS1.3 hack where PSK binders have a

@@ -708,13 +708,54 @@ impl TlsListElement for KeyShareEntry {
 /// ignore the preference of the client.
 ///
 /// RFC8446: `ProtocolVersion versions<2..254>;`
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SupportedProtocolVersions {
     pub(crate) tls13: bool,
     pub(crate) tls12: bool,
+    order: [ProtocolVersion; 2],
+    order_len: usize,
+    grease: Option<(usize, ProtocolVersion)>,
 }
 
 impl SupportedProtocolVersions {
+    pub(crate) fn from_flags(tls12: bool, tls13: bool) -> Self {
+        let mut out = Self::default();
+        if tls13 {
+            out.push(ProtocolVersion::TLSv1_3);
+        }
+        if tls12 {
+            out.push(ProtocolVersion::TLSv1_2);
+        }
+        out
+    }
+
+    pub(crate) fn from_slice(versions: &[ProtocolVersion]) -> Self {
+        let mut out = Self::default();
+        for version in versions {
+            out.push(*version);
+        }
+        out
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ProtocolVersion] {
+        &self.order[..self.order_len]
+    }
+
+    pub(crate) fn set_grease(&mut self, position: usize, version: ProtocolVersion) {
+        self.grease = Some((position, version));
+    }
+
+    fn push(&mut self, version: ProtocolVersion) {
+        debug_assert!(self.order_len < self.order.len());
+        match version {
+            ProtocolVersion::TLSv1_3 => self.tls13 = true,
+            ProtocolVersion::TLSv1_2 => self.tls12 = true,
+            _ => return,
+        }
+        self.order[self.order_len] = version;
+        self.order_len += 1;
+    }
+
     /// Return true if `filter` returns true for any enabled version.
     pub(crate) fn any(&self, filter: impl Fn(ProtocolVersion) -> bool) -> bool {
         if self.tls13 && filter(ProtocolVersion::TLSv1_3) {
@@ -731,30 +772,62 @@ impl SupportedProtocolVersions {
     };
 }
 
+impl Default for SupportedProtocolVersions {
+    fn default() -> Self {
+        Self {
+            tls13: false,
+            tls12: false,
+            order: [ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_2],
+            order_len: 0,
+            grease: None,
+        }
+    }
+}
+
 impl Codec<'_> for SupportedProtocolVersions {
     fn encode(&self, bytes: &mut Vec<u8>) {
         let inner = LengthPrefixedBuffer::new(Self::LIST_LENGTH, bytes);
-        if self.tls13 {
-            ProtocolVersion::TLSv1_3.encode(inner.buf);
+        let mut versions = match self.order_len {
+            0 => {
+                let mut versions = Vec::new();
+                if self.tls13 {
+                    versions.push(ProtocolVersion::TLSv1_3);
+                }
+                if self.tls12 {
+                    versions.push(ProtocolVersion::TLSv1_2);
+                }
+                versions
+            }
+            _ => self.as_slice().to_vec(),
+        };
+
+        if let Some((position, version)) = self.grease {
+            if position <= versions.len() {
+                versions.insert(position, version);
+            }
         }
-        if self.tls12 {
-            ProtocolVersion::TLSv1_2.encode(inner.buf);
+
+        for version in versions {
+            version.encode(inner.buf);
         }
     }
 
     fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
-        let mut tls12 = false;
-        let mut tls13 = false;
+        let mut versions = Self::default();
 
         for pv in TlsListIter::<ProtocolVersion>::new(reader)? {
             match pv? {
-                ProtocolVersion::TLSv1_3 => tls13 = true,
-                ProtocolVersion::TLSv1_2 => tls12 = true,
+                ProtocolVersion::TLSv1_3 if !versions.tls13 => {
+                    versions.push(ProtocolVersion::TLSv1_3)
+                }
+                ProtocolVersion::TLSv1_2 if !versions.tls12 => {
+                    versions.push(ProtocolVersion::TLSv1_2)
+                }
                 _ => continue,
             };
         }
 
-        Ok(Self { tls13, tls12 })
+        Ok(versions)
     }
 }
 
@@ -886,6 +959,10 @@ extension_struct! {
         ExtensionType::ExtendedMasterSecret =>
             pub(crate) extended_master_secret_request: Option<()>,
 
+        /// ClientHello padding (RFC7685)
+        ExtensionType::Padding =>
+            pub(crate) padding: Option<Payload<'a>>,
+
         /// Offered certificate compression methods (RFC8879)
         ExtensionType::CompressCertificate =>
             pub(crate) certificate_compression_algorithms: Option<Vec<CertificateCompressionAlgorithm>>,
@@ -950,6 +1027,20 @@ extension_struct! {
 
         /// Optional full order for extensions that are not forced to the final positions.
         pub(crate) custom_order: Option<Vec<ExtensionType>>,
+
+        /// GREASE extensions inserted into the non-final ClientHello extension order.
+        pub(crate) grease_extensions: Vec<(usize, ExtensionType)>,
+
+        /// Raw unknown extensions inserted into the non-final ClientHello extension order.
+        pub(crate) raw_extensions: Vec<(ExtensionType, Payload<'static>)>,
+    }
+}
+
+fn insert_positioned_grease(order: &mut Vec<ExtensionType>, grease: &[(usize, ExtensionType)]) {
+    for (position, extension) in grease {
+        if *position <= order.len() {
+            order.insert(*position, *extension);
+        }
     }
 }
 
@@ -965,6 +1056,7 @@ impl ClientExtensions<'_> {
             client_certificate_types,
             server_certificate_types,
             extended_master_secret_request,
+            padding,
             certificate_compression_algorithms,
             session_ticket,
             preshared_key_offer,
@@ -982,6 +1074,8 @@ impl ClientExtensions<'_> {
             order_seed,
             contiguous_extensions,
             custom_order,
+            grease_extensions,
+            raw_extensions,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -993,6 +1087,7 @@ impl ClientExtensions<'_> {
             client_certificate_types,
             server_certificate_types,
             extended_master_secret_request,
+            padding: padding.map(|x| x.into_owned()),
             certificate_compression_algorithms,
             session_ticket,
             preshared_key_offer,
@@ -1010,11 +1105,23 @@ impl ClientExtensions<'_> {
             order_seed,
             contiguous_extensions,
             custom_order,
+            grease_extensions,
+            raw_extensions,
         }
     }
 
+    pub(crate) fn collect_used_with_raw(&self) -> Vec<ExtensionType> {
+        let mut used = self.collect_used();
+        used.extend(
+            self.raw_extensions
+                .iter()
+                .map(|(extension_type, _)| *extension_type),
+        );
+        used
+    }
+
     pub(crate) fn set_custom_order(&mut self, order: Vec<ExtensionType>) -> Result<(), Error> {
-        let mut required = self.collect_used();
+        let mut required = self.collect_used_with_raw();
         required.retain(|ext| {
             !matches!(
                 ext,
@@ -1043,6 +1150,7 @@ impl ClientExtensions<'_> {
             Some(order) => order.clone(),
             None => self.order_insensitive_extensions_in_random_order(),
         };
+        insert_positioned_grease(&mut exts, &self.grease_extensions);
         exts.extend(&self.contiguous_extensions);
 
         if self
@@ -1074,7 +1182,7 @@ impl ClientExtensions<'_> {
     /// - Lastly, any ECH and PSK extensions (in that order).  These
     ///   are required to be last by the standard.
     fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
-        let mut order = self.collect_used();
+        let mut order = self.collect_used_with_raw();
 
         // Remove extensions which have specific order requirements.
         order.retain(|ext| {
@@ -1093,6 +1201,12 @@ impl ClientExtensions<'_> {
 
         order
     }
+
+    fn raw_extension_payload(&self, item: ExtensionType) -> Option<&Payload<'static>> {
+        self.raw_extensions
+            .iter()
+            .find_map(|(extension_type, payload)| (*extension_type == item).then_some(payload))
+    }
 }
 
 impl<'a> Codec<'a> for ClientExtensions<'a> {
@@ -1105,7 +1219,20 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
 
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         for item in order {
-            self.encode_one(item, body.buf);
+            if self
+                .grease_extensions
+                .iter()
+                .any(|(_, extension)| *extension == item)
+            {
+                item.encode(body.buf);
+                0u16.encode(body.buf);
+            } else if let Some(payload) = self.raw_extension_payload(item) {
+                item.encode(body.buf);
+                (payload.bytes().len() as u16).encode(body.buf);
+                payload.encode(body.buf);
+            } else {
+                self.encode_one(item, body.buf);
+            }
         }
     }
 

@@ -1,10 +1,15 @@
 use alloc::collections::BTreeSet;
+use alloc::format;
 use alloc::vec::Vec;
 use core::fmt;
 
 use pki_types::ServerName;
 
 use crate::crypto::CryptoProvider;
+use crate::enums::{
+    CertificateCompressionAlgorithm, CipherSuite, ProtocolVersion, SignatureScheme,
+};
+use crate::msgs::enums::{ExtensionType, NamedGroup};
 use crate::sync::Arc;
 use crate::{Error, SupportedProtocolVersion};
 
@@ -111,6 +116,504 @@ impl TryFrom<Vec<u16>> for ClientHelloExtensionOrder {
     }
 }
 
+/// Structured ClientHello extension presence controls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloExtensionPlan {
+    disabled: Vec<ClientHelloExtensionType>,
+}
+
+impl ClientHelloExtensionPlan {
+    /// Return extension types that should not be emitted.
+    pub fn disabled_extensions(&self) -> &[ClientHelloExtensionType] {
+        &self.disabled
+    }
+}
+
+impl TryFrom<Vec<u16>> for ClientHelloExtensionPlan {
+    type Error = Error;
+
+    fn try_from(value: Vec<u16>) -> Result<Self, Self::Error> {
+        let mut seen = BTreeSet::new();
+        for extension in &value {
+            if !seen.insert(*extension) {
+                return Err(Error::General(
+                    "ClientHello extension plan contains a duplicate disabled extension".into(),
+                ));
+            }
+            if matches!(ExtensionType::from(*extension), ExtensionType::Unknown(_)) {
+                return Err(Error::General(
+                    "ClientHello extension plan cannot disable unknown extensions".into(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            disabled: value
+                .into_iter()
+                .map(ClientHelloExtensionType)
+                .collect(),
+        })
+    }
+}
+
+/// Explicit ALPN protocol list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloAlpnProtocols(Vec<Vec<u8>>);
+
+impl ClientHelloAlpnProtocols {
+    /// Return the ordered ALPN protocol list.
+    pub fn as_slice(&self) -> &[Vec<u8>] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<Vec<u8>>> for ClientHelloAlpnProtocols {
+    type Error = Error;
+
+    fn try_from(value: Vec<Vec<u8>>) -> Result<Self, Self::Error> {
+        let mut seen = BTreeSet::new();
+        for protocol in &value {
+            if protocol.is_empty() {
+                return Err(Error::General(
+                    "ClientHello ALPN protocol name cannot be empty".into(),
+                ));
+            }
+            if protocol.len() > usize::from(u8::MAX) {
+                return Err(Error::General(
+                    "ClientHello ALPN protocol name cannot exceed 255 bytes".into(),
+                ));
+            }
+            if !seen.insert(protocol.clone()) {
+                return Err(Error::General(
+                    "ClientHello ALPN protocols contain a duplicate value".into(),
+                ));
+            }
+        }
+
+        Ok(Self(value))
+    }
+}
+
+fn reject_empty_and_duplicate_keys<T, K>(
+    values: &[T],
+    mut key: impl FnMut(T) -> K,
+    what: &str,
+) -> Result<(), Error>
+where
+    T: Copy,
+    K: Ord,
+{
+    if values.is_empty() {
+        return Err(Error::General(
+            format!("ClientHello {what} cannot be empty").into(),
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !seen.insert(key(*value)) {
+            return Err(Error::General(
+                format!("ClientHello {what} contains a duplicate value").into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Explicit cipher suite list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloCipherSuites(Vec<CipherSuite>);
+
+impl ClientHelloCipherSuites {
+    /// Return the ordered cipher suite list.
+    pub fn as_slice(&self) -> &[CipherSuite] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<CipherSuite>> for ClientHelloCipherSuites {
+    type Error = Error;
+
+    fn try_from(value: Vec<CipherSuite>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "cipher suites")?;
+        if value
+            .iter()
+            .any(|suite| matches!(suite, CipherSuite::Unknown(_)))
+        {
+            return Err(Error::General(
+                "ClientHello cipher suites cannot contain unknown values".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit TLS supported_versions list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloSupportedVersions(Vec<ProtocolVersion>);
+
+impl ClientHelloSupportedVersions {
+    /// Return the ordered supported versions.
+    pub fn as_slice(&self) -> &[ProtocolVersion] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<ProtocolVersion>> for ClientHelloSupportedVersions {
+    type Error = Error;
+
+    fn try_from(value: Vec<ProtocolVersion>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "supported versions")?;
+        if value
+            .iter()
+            .any(|version| !matches!(version, ProtocolVersion::TLSv1_2 | ProtocolVersion::TLSv1_3))
+        {
+            return Err(Error::General(
+                "ClientHello supported versions can only contain TLS 1.2 and TLS 1.3".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit supported_groups list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloSupportedGroups(Vec<NamedGroup>);
+
+impl ClientHelloSupportedGroups {
+    /// Return the ordered supported groups.
+    pub fn as_slice(&self) -> &[NamedGroup] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<NamedGroup>> for ClientHelloSupportedGroups {
+    type Error = Error;
+
+    fn try_from(value: Vec<NamedGroup>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "supported groups")?;
+        if value
+            .iter()
+            .any(|group| matches!(group, NamedGroup::Unknown(_)))
+        {
+            return Err(Error::General(
+                "ClientHello supported groups cannot contain unknown values".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit key_share group list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloKeySharePlan(Vec<NamedGroup>);
+
+impl ClientHelloKeySharePlan {
+    /// Return the ordered key_share groups.
+    pub fn as_slice(&self) -> &[NamedGroup] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<NamedGroup>> for ClientHelloKeySharePlan {
+    type Error = Error;
+
+    fn try_from(value: Vec<NamedGroup>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "key share groups")?;
+        if value
+            .iter()
+            .any(|group| matches!(group, NamedGroup::Unknown(_)))
+        {
+            return Err(Error::General(
+                "ClientHello key share groups cannot contain unknown values".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit signature_algorithms list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloSignatureAlgorithms(Vec<SignatureScheme>);
+
+impl ClientHelloSignatureAlgorithms {
+    /// Return the ordered signature algorithms.
+    pub fn as_slice(&self) -> &[SignatureScheme] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<SignatureScheme>> for ClientHelloSignatureAlgorithms {
+    type Error = Error;
+
+    fn try_from(value: Vec<SignatureScheme>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "signature algorithms")?;
+        if value
+            .iter()
+            .any(|scheme| matches!(scheme, SignatureScheme::Unknown(_)))
+        {
+            return Err(Error::General(
+                "ClientHello signature algorithms cannot contain unknown values".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit compress_certificate algorithm list and order for the ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloCertificateCompressionAlgorithms(Vec<CertificateCompressionAlgorithm>);
+
+impl ClientHelloCertificateCompressionAlgorithms {
+    /// Return the ordered certificate compression algorithm list.
+    pub fn as_slice(&self) -> &[CertificateCompressionAlgorithm] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<CertificateCompressionAlgorithm>> for ClientHelloCertificateCompressionAlgorithms {
+    type Error = Error;
+
+    fn try_from(value: Vec<CertificateCompressionAlgorithm>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "certificate compression algorithms")?;
+        if value
+            .iter()
+            .any(|algorithm| matches!(algorithm, CertificateCompressionAlgorithm::Unknown(_)))
+        {
+            return Err(Error::General(
+                "ClientHello certificate compression algorithms cannot contain unknown values"
+                    .into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// A bounded raw unknown ClientHello extension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloRawExtension {
+    extension_type: ClientHelloExtensionType,
+    payload: Vec<u8>,
+}
+
+impl ClientHelloRawExtension {
+    /// Create a raw unknown ClientHello extension.
+    ///
+    /// Known extensions and GREASE values are rejected so this escape hatch
+    /// cannot silently override structured ClientHello controls.
+    pub fn new(extension_type: u16, payload: Vec<u8>) -> Result<Self, Error> {
+        if payload.len() > usize::from(u16::MAX) {
+            return Err(Error::General(
+                "ClientHello raw extension payload cannot exceed 65535 bytes".into(),
+            ));
+        }
+        if !matches!(
+            ExtensionType::from(extension_type),
+            ExtensionType::Unknown(_)
+        ) {
+            return Err(Error::General(
+                "ClientHello raw extension type must be unknown".into(),
+            ));
+        }
+        if is_grease_value(extension_type) {
+            return Err(Error::General(
+                "ClientHello raw extension type cannot be a GREASE value".into(),
+            ));
+        }
+
+        Ok(Self {
+            extension_type: ClientHelloExtensionType(extension_type),
+            payload,
+        })
+    }
+
+    /// Return the extension type.
+    pub fn extension_type(&self) -> ClientHelloExtensionType {
+        self.extension_type
+    }
+
+    /// Return the extension body bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// Raw unknown ClientHello extensions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloRawExtensions(Vec<ClientHelloRawExtension>);
+
+impl ClientHelloRawExtensions {
+    /// Return the raw extension list.
+    pub fn as_slice(&self) -> &[ClientHelloRawExtension] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<ClientHelloRawExtension>> for ClientHelloRawExtensions {
+    type Error = Error;
+
+    fn try_from(value: Vec<ClientHelloRawExtension>) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(Error::General(
+                "ClientHello raw extensions cannot be empty".into(),
+            ));
+        }
+
+        let mut seen = BTreeSet::new();
+        for extension in &value {
+            if !seen.insert(extension.extension_type.0) {
+                return Err(Error::General(
+                    "ClientHello raw extensions contain a duplicate extension".into(),
+                ));
+            }
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit GREASE value and insertion positions for ClientHello shaping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloGreasePlan {
+    value: u16,
+    cipher_suite_position: Option<usize>,
+    extension_position: Option<usize>,
+    supported_version_position: Option<usize>,
+    supported_group_position: Option<usize>,
+    key_share_position: Option<usize>,
+}
+
+impl ClientHelloGreasePlan {
+    /// Create a GREASE plan using one of the RFC 8701 reserved values.
+    pub fn new(value: u16) -> Result<Self, Error> {
+        if !is_grease_value(value) {
+            return Err(Error::General(
+                "ClientHello GREASE value must be an RFC 8701 reserved value".into(),
+            ));
+        }
+
+        Ok(Self {
+            value,
+            cipher_suite_position: None,
+            extension_position: None,
+            supported_version_position: None,
+            supported_group_position: None,
+            key_share_position: None,
+        })
+    }
+
+    /// Return the GREASE value used for every configured slot.
+    pub fn value(&self) -> u16 {
+        self.value
+    }
+
+    /// Insert the GREASE value into the cipher suite list at `position`.
+    pub fn with_cipher_suite_position(mut self, position: usize) -> Self {
+        self.cipher_suite_position = Some(position);
+        self
+    }
+
+    /// Insert the GREASE extension into the extension list at `position`.
+    pub fn with_extension_position(mut self, position: usize) -> Self {
+        self.extension_position = Some(position);
+        self
+    }
+
+    /// Insert the GREASE value into supported_versions at `position`.
+    pub fn with_supported_version_position(mut self, position: usize) -> Self {
+        self.supported_version_position = Some(position);
+        self
+    }
+
+    /// Insert the GREASE value into supported_groups at `position`.
+    pub fn with_supported_group_position(mut self, position: usize) -> Self {
+        self.supported_group_position = Some(position);
+        self
+    }
+
+    /// Insert a GREASE key_share entry at `position`.
+    pub fn with_key_share_position(mut self, position: usize) -> Self {
+        self.key_share_position = Some(position);
+        self
+    }
+
+    pub(crate) fn cipher_suite_position(&self) -> Option<usize> {
+        self.cipher_suite_position
+    }
+
+    pub(crate) fn extension_position(&self) -> Option<usize> {
+        self.extension_position
+    }
+
+    pub(crate) fn supported_version_position(&self) -> Option<usize> {
+        self.supported_version_position
+    }
+
+    pub(crate) fn supported_group_position(&self) -> Option<usize> {
+        self.supported_group_position
+    }
+
+    pub(crate) fn key_share_position(&self) -> Option<usize> {
+        self.key_share_position
+    }
+}
+
+fn is_grease_value(value: u16) -> bool {
+    let [high, low] = value.to_be_bytes();
+    high == low && high & 0x0f == 0x0a
+}
+
+/// ClientHello padding extension behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientHelloPaddingMode {
+    Fixed(u16),
+    PadToHandshakeSize(u16),
+}
+
+/// Structured control for the ClientHello padding extension.
+///
+/// Padding bytes are always encoded as zero bytes, as required by RFC 7685.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloPaddingPlan {
+    mode: ClientHelloPaddingMode,
+}
+
+impl ClientHelloPaddingPlan {
+    /// Emit a padding extension with exactly `length` zero bytes.
+    pub fn fixed(length: usize) -> Result<Self, Error> {
+        Ok(Self {
+            mode: ClientHelloPaddingMode::Fixed(validate_padding_size(length)?),
+        })
+    }
+
+    /// Pad the encoded ClientHello handshake message to at least `target_size` bytes.
+    ///
+    /// `target_size` counts the four-byte TLS handshake header as well as the
+    /// ClientHello body. If the ClientHello is already at or above the target
+    /// size, an empty padding extension is emitted.
+    pub fn pad_to_handshake_size(target_size: usize) -> Result<Self, Error> {
+        Ok(Self {
+            mode: ClientHelloPaddingMode::PadToHandshakeSize(validate_padding_size(target_size)?),
+        })
+    }
+
+    pub(crate) fn mode(&self) -> ClientHelloPaddingMode {
+        self.mode
+    }
+}
+
+fn validate_padding_size(size: usize) -> Result<u16, Error> {
+    u16::try_from(size)
+        .map_err(|_| Error::General("ClientHello padding size cannot exceed 65535 bytes".into()))
+}
+
 /// Fixed X25519 key share material.
 ///
 /// Using a fixed key share disables the normal forward secrecy properties
@@ -172,6 +675,18 @@ pub struct ClientHelloPlan {
     pub(crate) capture: Option<Arc<dyn CapturesClientHello>>,
     pub(crate) fixed_x25519: Option<FixedX25519KeyShare>,
     pub(crate) extension_order: Option<ClientHelloExtensionOrder>,
+    pub(crate) extensions: Option<ClientHelloExtensionPlan>,
+    pub(crate) alpn_protocols: Option<ClientHelloAlpnProtocols>,
+    pub(crate) cipher_suites: Option<ClientHelloCipherSuites>,
+    pub(crate) supported_versions: Option<ClientHelloSupportedVersions>,
+    pub(crate) supported_groups: Option<ClientHelloSupportedGroups>,
+    pub(crate) key_share_plan: Option<ClientHelloKeySharePlan>,
+    pub(crate) signature_algorithms: Option<ClientHelloSignatureAlgorithms>,
+    pub(crate) certificate_compression_algorithms:
+        Option<ClientHelloCertificateCompressionAlgorithms>,
+    pub(crate) raw_extensions: Option<ClientHelloRawExtensions>,
+    pub(crate) grease: Option<ClientHelloGreasePlan>,
+    pub(crate) padding: Option<ClientHelloPaddingPlan>,
 }
 
 impl ClientHelloPlan {
@@ -207,6 +722,78 @@ impl ClientHelloPlan {
     /// Use an explicit ClientHello extension order.
     pub fn with_extension_order(mut self, order: ClientHelloExtensionOrder) -> Self {
         self.extension_order = Some(order);
+        self
+    }
+
+    /// Use structured ClientHello extension presence controls.
+    pub fn with_extensions(mut self, extensions: ClientHelloExtensionPlan) -> Self {
+        self.extensions = Some(extensions);
+        self
+    }
+
+    /// Use an explicit ALPN protocol list and order.
+    pub fn with_alpn_protocols(mut self, protocols: ClientHelloAlpnProtocols) -> Self {
+        self.alpn_protocols = Some(protocols);
+        self
+    }
+
+    /// Use an explicit cipher suite list and order.
+    pub fn with_cipher_suites(mut self, cipher_suites: ClientHelloCipherSuites) -> Self {
+        self.cipher_suites = Some(cipher_suites);
+        self
+    }
+
+    /// Use an explicit supported_versions list and order.
+    pub fn with_supported_versions(mut self, versions: ClientHelloSupportedVersions) -> Self {
+        self.supported_versions = Some(versions);
+        self
+    }
+
+    /// Use an explicit supported_groups list and order.
+    pub fn with_supported_groups(mut self, groups: ClientHelloSupportedGroups) -> Self {
+        self.supported_groups = Some(groups);
+        self
+    }
+
+    /// Use an explicit key_share group list and order.
+    pub fn with_key_share_plan(mut self, key_share_plan: ClientHelloKeySharePlan) -> Self {
+        self.key_share_plan = Some(key_share_plan);
+        self
+    }
+
+    /// Use an explicit signature_algorithms list and order.
+    pub fn with_signature_algorithms(
+        mut self,
+        signature_algorithms: ClientHelloSignatureAlgorithms,
+    ) -> Self {
+        self.signature_algorithms = Some(signature_algorithms);
+        self
+    }
+
+    /// Use an explicit compress_certificate algorithm list and order.
+    pub fn with_certificate_compression_algorithms(
+        mut self,
+        algorithms: ClientHelloCertificateCompressionAlgorithms,
+    ) -> Self {
+        self.certificate_compression_algorithms = Some(algorithms);
+        self
+    }
+
+    /// Add raw unknown ClientHello extensions.
+    pub fn with_raw_extensions(mut self, extensions: ClientHelloRawExtensions) -> Self {
+        self.raw_extensions = Some(extensions);
+        self
+    }
+
+    /// Use explicit GREASE insertion controls.
+    pub fn with_grease(mut self, grease: ClientHelloGreasePlan) -> Self {
+        self.grease = Some(grease);
+        self
+    }
+
+    /// Use explicit ClientHello padding extension controls.
+    pub fn with_padding(mut self, padding: ClientHelloPaddingPlan) -> Self {
+        self.padding = Some(padding);
         self
     }
 }

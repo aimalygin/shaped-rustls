@@ -1,11 +1,13 @@
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
 use pki_types::ServerName;
 
+use super::client_hello::ClientHelloPaddingMode;
 #[cfg(feature = "tls12")]
 use super::tls12;
 use super::{ResolvesClientCert, Tls12Resumption};
@@ -17,17 +19,19 @@ use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
 use crate::client::{ClientConfig, ClientHelloContext, ClientHelloPlan, EchMode, EchStatus, tls13};
-use crate::common_state::{CommonState, HandshakeKind, KxState, State};
+use crate::common_state::{CommonState, HandshakeKind, Protocol, State};
 use crate::conn::ConnectionRandoms;
-use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+use crate::crypto::KeyExchangeAlgorithm;
 use crate::enums::{
-    AlertDescription, CertificateType, CipherSuite, ContentType, HandshakeType, ProtocolVersion,
+    AlertDescription, CertificateCompressionAlgorithm, CertificateType, CipherSuite, ContentType,
+    HandshakeType, ProtocolVersion,
 };
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
-use crate::msgs::enums::{Compression, ExtensionType};
+use crate::msgs::codec::Codec;
+use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
     ClientSessionTicket, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
@@ -56,7 +60,7 @@ struct ExpectServerHello {
     //
     // If this is `None` then we do not support early data.
     early_data_key_schedule: Option<KeyScheduleEarly>,
-    offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
+    offered_key_share: Option<tls13::OfferedKeyShares>,
     suite: Option<SupportedCipherSuite>,
     ech_state: Option<EchState>,
 }
@@ -203,8 +207,19 @@ impl ClientHelloInput {
             transcript_buffer.set_client_auth_enabled();
         }
 
-        let key_share = if self.config.needs_key_share() {
-            Some(tls13::initial_key_share(
+        let needs_key_share = self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.supported_versions.as_ref())
+            .map(|versions| {
+                versions
+                    .as_slice()
+                    .contains(&ProtocolVersion::TLSv1_3)
+            })
+            .unwrap_or_else(|| self.config.needs_key_share());
+
+        let key_share = if needs_key_share {
+            Some(tls13::initial_key_shares(
                 &self.config,
                 &self.server_name,
                 &mut cx.common.kx_state,
@@ -234,6 +249,438 @@ impl ClientHelloInput {
     }
 }
 
+fn default_supported_versions(
+    config: &ClientConfig,
+    forbids_tls12: bool,
+) -> SupportedProtocolVersions {
+    SupportedProtocolVersions::from_flags(
+        config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12,
+        config.supports_version(ProtocolVersion::TLSv1_3),
+    )
+}
+
+fn planned_supported_versions(
+    plan: Option<&ClientHelloPlan>,
+    config: &ClientConfig,
+    forbids_tls12: bool,
+) -> Result<SupportedProtocolVersions, Error> {
+    let Some(versions) = plan.and_then(|plan| plan.supported_versions.as_ref()) else {
+        return Ok(default_supported_versions(config, forbids_tls12));
+    };
+
+    for version in versions.as_slice() {
+        let supported = match *version {
+            ProtocolVersion::TLSv1_2 => {
+                !forbids_tls12 && config.supports_version(ProtocolVersion::TLSv1_2)
+            }
+            ProtocolVersion::TLSv1_3 => config.supports_version(ProtocolVersion::TLSv1_3),
+            _ => false,
+        };
+
+        if !supported {
+            return Err(Error::General(
+                "ClientHello supported version is not enabled by this config".into(),
+            ));
+        }
+    }
+
+    Ok(SupportedProtocolVersions::from_slice(versions.as_slice()))
+}
+
+fn validate_cipher_suites(
+    cipher_suites: &[CipherSuite],
+    config: &ClientConfig,
+    protocol: Protocol,
+    supported_versions: &SupportedProtocolVersions,
+) -> Result<(), Error> {
+    for suite in cipher_suites {
+        if *suite == CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV {
+            if supported_versions.tls12 {
+                continue;
+            }
+
+            return Err(Error::General(
+                "ClientHello cipher suite is not usable for the supported versions".into(),
+            ));
+        }
+
+        let supported = config
+            .provider
+            .cipher_suites
+            .iter()
+            .any(|candidate| {
+                candidate.suite() == *suite
+                    && candidate.usable_for_protocol(protocol)
+                    && supported_versions.any(|version| candidate.version().version == version)
+            });
+
+        if !supported {
+            return Err(Error::General(
+                "ClientHello cipher suite is not supported by this config".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_supported_groups(
+    groups: &[NamedGroup],
+    config: &ClientConfig,
+    supported_versions: &SupportedProtocolVersions,
+) -> Result<(), Error> {
+    for group in groups {
+        let supported = config
+            .provider
+            .kx_groups
+            .iter()
+            .any(|candidate| {
+                candidate.name() == *group
+                    && supported_versions.any(|version| candidate.usable_for_version(version))
+            });
+
+        if !supported {
+            return Err(Error::General(
+                "ClientHello supported group is not supported by this config".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_signature_algorithms(
+    signature_algorithms: &[crate::SignatureScheme],
+    config: &ClientConfig,
+) -> Result<(), Error> {
+    let supported = config
+        .verifier
+        .supported_verify_schemes();
+
+    for algorithm in signature_algorithms {
+        if !supported.contains(algorithm) {
+            return Err(Error::General(
+                "ClientHello signature algorithm is not supported by this config".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_certificate_compression_algorithms(
+    algorithms: &[CertificateCompressionAlgorithm],
+    config: &ClientConfig,
+    supported_versions: &SupportedProtocolVersions,
+) -> Result<(), Error> {
+    if !supported_versions.tls13 {
+        return Err(Error::General(
+            "ClientHello certificate compression requires TLS 1.3 support".into(),
+        ));
+    }
+
+    for algorithm in algorithms {
+        if !config
+            .cert_decompressors
+            .iter()
+            .any(|decompressor| decompressor.algorithm() == *algorithm)
+        {
+            return Err(Error::General(
+                "ClientHello certificate compression algorithm is not supported by this config"
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_alpn_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+    hello: &mut ClientHelloDetails,
+) {
+    let Some(protocols) = plan.and_then(|plan| plan.alpn_protocols.as_ref()) else {
+        return;
+    };
+
+    let protocols = match protocols.as_slice().is_empty() {
+        true => None,
+        false => Some(
+            protocols
+                .as_slice()
+                .iter()
+                .cloned()
+                .map(ProtocolName::from)
+                .collect::<Vec<_>>(),
+        ),
+    };
+    hello.alpn_protocols = protocols.clone().unwrap_or_default();
+    exts.protocols = protocols;
+}
+
+fn apply_extension_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+    hello: &mut ClientHelloDetails,
+    supported_versions: &SupportedProtocolVersions,
+    require_ems: bool,
+) -> Result<(), Error> {
+    let Some(extensions) = plan.and_then(|plan| plan.extensions.as_ref()) else {
+        return Ok(());
+    };
+
+    for extension in extensions.disabled_extensions() {
+        match ExtensionType::from(extension.0) {
+            ExtensionType::SupportedVersions
+            | ExtensionType::SignatureAlgorithms
+            | ExtensionType::KeyShare => {
+                return Err(Error::General(
+                    "ClientHello extension plan cannot disable a required extension".into(),
+                ));
+            }
+            ExtensionType::EllipticCurves if supported_versions.tls13 => {
+                return Err(Error::General(
+                    "ClientHello extension plan cannot disable a required extension".into(),
+                ));
+            }
+            ExtensionType::EncryptedClientHello
+            | ExtensionType::EncryptedClientHelloOuterExtensions
+            | ExtensionType::TransportParameters
+            | ExtensionType::TransportParametersDraft => {
+                return Err(Error::General(
+                    "ClientHello extension plan cannot disable a managed extension".into(),
+                ));
+            }
+            ExtensionType::ExtendedMasterSecret if require_ems && supported_versions.tls12 => {
+                return Err(Error::General(
+                    "ClientHello extension plan cannot disable extended_master_secret when it is required".into(),
+                ));
+            }
+            ExtensionType::ServerName => exts.server_name = None,
+            ExtensionType::StatusRequest => exts.certificate_status_request = None,
+            ExtensionType::EllipticCurves => exts.named_groups = None,
+            ExtensionType::ECPointFormats => exts.ec_point_formats = None,
+            ExtensionType::SignatureAlgorithmsCert => {}
+            ExtensionType::ALProtocolNegotiation => {
+                exts.protocols = None;
+                hello.alpn_protocols.clear();
+            }
+            ExtensionType::ClientCertificateType => exts.client_certificate_types = None,
+            ExtensionType::ServerCertificateType => exts.server_certificate_types = None,
+            ExtensionType::ExtendedMasterSecret => exts.extended_master_secret_request = None,
+            ExtensionType::Padding => exts.padding = None,
+            ExtensionType::CompressCertificate => {
+                exts.certificate_compression_algorithms = None;
+                hello.offered_cert_compression = false;
+            }
+            ExtensionType::SessionTicket => exts.session_ticket = None,
+            ExtensionType::PreSharedKey => {
+                if exts.preshared_key_offer.is_some() {
+                    return Err(Error::General(
+                        "ClientHello extension plan cannot disable an active pre_shared_key extension".into(),
+                    ));
+                }
+            }
+            ExtensionType::EarlyData => exts.early_data_request = None,
+            ExtensionType::Cookie => exts.cookie = None,
+            ExtensionType::PSKKeyExchangeModes => {
+                if exts.preshared_key_offer.is_some() {
+                    return Err(Error::General(
+                        "ClientHello extension plan cannot disable psk_key_exchange_modes when offering PSK".into(),
+                    ));
+                }
+                exts.preshared_key_modes = None;
+            }
+            ExtensionType::CertificateAuthorities => exts.certificate_authority_names = None,
+            ExtensionType::RenegotiationInfo => exts.renegotiation_info = None,
+            ExtensionType::SCT
+            | ExtensionType::MaxFragmentLength
+            | ExtensionType::ClientCertificateUrl
+            | ExtensionType::TrustedCAKeys
+            | ExtensionType::TruncatedHMAC
+            | ExtensionType::UserMapping
+            | ExtensionType::ClientAuthz
+            | ExtensionType::ServerAuthz
+            | ExtensionType::CertificateType
+            | ExtensionType::SRP
+            | ExtensionType::UseSRTP
+            | ExtensionType::Heartbeat
+            | ExtensionType::TicketEarlyDataInfo
+            | ExtensionType::OIDFilters
+            | ExtensionType::PostHandshakeAuth
+            | ExtensionType::NextProtocolNegotiation
+            | ExtensionType::ChannelId
+            | ExtensionType::Unknown(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn zero_padding(length: u16) -> Payload<'static> {
+    Payload::new(vec![0; usize::from(length)])
+}
+
+fn apply_padding_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+) -> Result<(), Error> {
+    let Some(padding) = plan.and_then(|plan| plan.padding.as_ref()) else {
+        return Ok(());
+    };
+
+    let length = match padding.mode() {
+        ClientHelloPaddingMode::Fixed(length) => length,
+        ClientHelloPaddingMode::PadToHandshakeSize(_) => 0,
+    };
+    exts.padding = Some(zero_padding(length));
+    Ok(())
+}
+
+fn apply_raw_extension_plan(plan: Option<&ClientHelloPlan>, exts: &mut ClientExtensions<'_>) {
+    let Some(raw_extensions) = plan.and_then(|plan| plan.raw_extensions.as_ref()) else {
+        return;
+    };
+
+    exts.raw_extensions = raw_extensions
+        .as_slice()
+        .iter()
+        .map(|extension| {
+            (
+                ExtensionType::from(extension.extension_type().0),
+                Payload::new(extension.payload().to_vec()),
+            )
+        })
+        .collect();
+}
+
+fn encoded_client_hello_len(payload: &ClientHelloPayload) -> usize {
+    let mut bytes = Vec::new();
+    HandshakeMessagePayload(HandshakePayload::ClientHello(payload.clone())).encode(&mut bytes);
+    bytes.len()
+}
+
+fn finalize_padding_plan(
+    plan: Option<&ClientHelloPlan>,
+    payload: &mut ClientHelloPayload,
+) -> Result<(), Error> {
+    let Some(padding) = plan.and_then(|plan| plan.padding.as_ref()) else {
+        return Ok(());
+    };
+
+    if let ClientHelloPaddingMode::PadToHandshakeSize(target_size) = padding.mode() {
+        payload.extensions.padding = Some(Payload::empty());
+        let current_size = encoded_client_hello_len(payload);
+        let padding_len = usize::from(target_size).saturating_sub(current_size);
+        let padding_len = u16::try_from(padding_len).map_err(|_| {
+            Error::General("ClientHello padding size cannot exceed 65535 bytes".into())
+        })?;
+        payload.extensions.padding = Some(zero_padding(padding_len));
+    }
+
+    Ok(())
+}
+
+fn insert_at<T>(items: &mut Vec<T>, position: usize, value: T, what: &str) -> Result<(), Error> {
+    if position > items.len() {
+        return Err(Error::General(
+            format!("ClientHello GREASE position is out of range for {what}").into(),
+        ));
+    }
+
+    items.insert(position, value);
+    Ok(())
+}
+
+fn non_final_extension_count(exts: &ClientExtensions<'_>) -> usize {
+    let mut order = exts.collect_used();
+    order.retain(|ext| {
+        !(matches!(
+            ext,
+            ExtensionType::PreSharedKey
+                | ExtensionType::EncryptedClientHello
+                | ExtensionType::EncryptedClientHelloOuterExtensions
+        ) || exts.contiguous_extensions.contains(ext))
+    });
+    order.len()
+}
+
+fn apply_grease_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+    cipher_suites: &mut Vec<CipherSuite>,
+) -> Result<(), Error> {
+    let Some(grease) = plan.and_then(|plan| plan.grease.as_ref()) else {
+        return Ok(());
+    };
+    let value = grease.value();
+
+    if let Some(position) = grease.cipher_suite_position() {
+        insert_at(
+            cipher_suites,
+            position,
+            CipherSuite::from(value),
+            "cipher suites",
+        )?;
+    }
+
+    if let Some(position) = grease.supported_version_position() {
+        let Some(supported_versions) = exts.supported_versions.as_mut() else {
+            return Err(Error::General(
+                "ClientHello GREASE supported_version requires a supported_versions extension"
+                    .into(),
+            ));
+        };
+        if position > supported_versions.as_slice().len() {
+            return Err(Error::General(
+                "ClientHello GREASE position is out of range for supported versions".into(),
+            ));
+        }
+        supported_versions.set_grease(position, ProtocolVersion::from(value));
+    }
+
+    if let Some(position) = grease.supported_group_position() {
+        let Some(named_groups) = exts.named_groups.as_mut() else {
+            return Err(Error::General(
+                "ClientHello GREASE supported_group requires a supported_groups extension".into(),
+            ));
+        };
+        insert_at(
+            named_groups,
+            position,
+            NamedGroup::from(value),
+            "supported groups",
+        )?;
+    }
+
+    if let Some(position) = grease.key_share_position() {
+        let Some(key_shares) = exts.key_shares.as_mut() else {
+            return Err(Error::General(
+                "ClientHello GREASE key_share requires a key_share extension".into(),
+            ));
+        };
+        insert_at(
+            key_shares,
+            position,
+            KeyShareEntry::new(NamedGroup::from(value), vec![0]),
+            "key shares",
+        )?;
+    }
+
+    if let Some(position) = grease.extension_position() {
+        if position > non_final_extension_count(exts) {
+            return Err(Error::General(
+                "ClientHello GREASE position is out of range for extensions".into(),
+            ));
+        }
+        exts.grease_extensions
+            .push((position, ExtensionType::from(value)));
+    }
+
+    Ok(())
+}
+
 /// Emits the initial ClientHello or a ClientHello in response to
 /// a HelloRetryRequest.
 ///
@@ -242,7 +689,7 @@ impl ClientHelloInput {
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
-    key_share: Option<Box<dyn ActiveKeyExchange>>,
+    key_share: Option<tls13::OfferedKeyShares>,
     extra_exts: ClientExtensionsInput<'static>,
     suite: Option<SupportedCipherSuite>,
     mut input: ClientHelloInput,
@@ -254,10 +701,8 @@ fn emit_client_hello_for_retry(
     // builder semantics.
     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
 
-    let supported_versions = SupportedProtocolVersions {
-        tls12: config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12,
-        tls13: config.supports_version(ProtocolVersion::TLSv1_3),
-    };
+    let supported_versions =
+        planned_supported_versions(input.plan.as_ref(), config, forbids_tls12)?;
 
     // should be unreachable thanks to config builder
     assert!(supported_versions.any(|_| true));
@@ -265,19 +710,39 @@ fn emit_client_hello_for_retry(
     let mut exts = Box::new(ClientExtensions {
         // offer groups which are usable for any offered version
         named_groups: Some(
-            config
-                .provider
-                .kx_groups
-                .iter()
-                .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-                .map(|skxg| skxg.name())
-                .collect(),
+            match input
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.supported_groups.as_ref())
+            {
+                Some(groups) => {
+                    validate_supported_groups(groups.as_slice(), config, &supported_versions)?;
+                    groups.as_slice().to_vec()
+                }
+                None => config
+                    .provider
+                    .kx_groups
+                    .iter()
+                    .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+                    .map(|skxg| skxg.name())
+                    .collect(),
+            },
         ),
         supported_versions: Some(supported_versions),
         signature_schemes: Some(
-            config
-                .verifier
-                .supported_verify_schemes(),
+            match input
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.signature_algorithms.as_ref())
+            {
+                Some(signature_algorithms) => {
+                    validate_signature_algorithms(signature_algorithms.as_slice(), config)?;
+                    signature_algorithms.as_slice().to_vec()
+                }
+                None => config
+                    .verifier
+                    .supported_verify_schemes(),
+            },
         ),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
@@ -327,30 +792,7 @@ fn emit_client_hello_for_retry(
 
     if let Some(key_share) = &key_share {
         debug_assert!(supported_versions.tls13);
-        let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
-
-        if !retryreq
-            .map(|rr| rr.key_share.is_some())
-            .unwrap_or_default()
-        {
-            // Only for the initial client hello, or a HRR that does not specify a kx group,
-            // see if we can send a second KeyShare for "free".  We only do this if the same
-            // algorithm is also supported separately by our provider for this version
-            // (`find_kx_group` looks that up).
-            if let Some((component_group, component_share)) =
-                key_share
-                    .hybrid_component()
-                    .filter(|(group, _)| {
-                        config
-                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
-                            .is_some()
-                    })
-            {
-                shares.push(KeyShareEntry::new(component_group, component_share));
-            }
-        }
-
-        exts.key_shares = Some(shares);
+        exts.key_shares = Some(key_share.key_share_entries()?);
     }
 
     if let Some(cookie) = retryreq.and_then(|hrr| hrr.cookie.as_ref()) {
@@ -366,8 +808,20 @@ fn emit_client_hello_for_retry(
         });
     }
 
-    input.hello.offered_cert_compression =
-        if supported_versions.tls13 && !config.cert_decompressors.is_empty() {
+    input.hello.offered_cert_compression = match input.plan.as_ref().and_then(|plan| {
+        plan.certificate_compression_algorithms
+            .as_ref()
+    }) {
+        Some(algorithms) => {
+            validate_certificate_compression_algorithms(
+                algorithms.as_slice(),
+                config,
+                &supported_versions,
+            )?;
+            exts.certificate_compression_algorithms = Some(algorithms.as_slice().to_vec());
+            true
+        }
+        None if supported_versions.tls13 && !config.cert_decompressors.is_empty() => {
             exts.certificate_compression_algorithms = Some(
                 config
                     .cert_decompressors
@@ -376,9 +830,9 @@ fn emit_client_hello_for_retry(
                     .collect(),
             );
             true
-        } else {
-            false
-        };
+        }
+        None => false,
+    };
 
     if config
         .client_auth_cert_resolver
@@ -410,20 +864,47 @@ fn emit_client_hello_for_retry(
     // but they also need to keep the same order as the previous ClientHello
     exts.order_seed = input.hello.extension_order_seed;
 
-    let mut cipher_suites: Vec<_> = config
-        .provider
-        .cipher_suites
-        .iter()
-        .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
-            true => Some(cs.suite()),
-            false => None,
-        })
-        .collect();
+    let custom_cipher_suites = input
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.cipher_suites.as_ref());
+    let mut cipher_suites: Vec<_> = match custom_cipher_suites {
+        Some(cipher_suites) => {
+            validate_cipher_suites(
+                cipher_suites.as_slice(),
+                config,
+                cx.common.protocol,
+                &supported_versions,
+            )?;
+            cipher_suites.as_slice().to_vec()
+        }
+        None => config
+            .provider
+            .cipher_suites
+            .iter()
+            .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
+                true => Some(cs.suite()),
+                false => None,
+            })
+            .collect(),
+    };
 
-    if supported_versions.tls12 {
+    if custom_cipher_suites.is_none() && supported_versions.tls12 {
         // We don't do renegotiation at all, in fact.
         cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
     }
+
+    apply_alpn_plan(input.plan.as_ref(), &mut exts, &mut input.hello);
+    apply_extension_plan(
+        input.plan.as_ref(),
+        &mut exts,
+        &mut input.hello,
+        &supported_versions,
+        config.require_ems,
+    )?;
+    apply_grease_plan(input.plan.as_ref(), &mut exts, &mut cipher_suites)?;
+    apply_padding_plan(input.plan.as_ref(), &mut exts)?;
+    apply_raw_extension_plan(input.plan.as_ref(), &mut exts);
 
     let mut chp_payload = ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_2,
@@ -489,8 +970,12 @@ fn emit_client_hello_for_retry(
         _ => {}
     }
 
+    finalize_padding_plan(input.plan.as_ref(), &mut chp_payload)?;
+
     // Note what extensions we sent.
-    input.hello.sent_extensions = chp_payload.collect_used();
+    input.hello.sent_extensions = chp_payload
+        .extensions
+        .collect_used_with_raw();
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
 
@@ -939,14 +1424,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         let config = &self.next.input.config;
 
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
-            let offered_hybrid = offered_key_share
-                .hybrid_component()
-                .and_then(|(group_name, _)| {
-                    config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
-                })
-                .map(|skxg| skxg.name());
-
-            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+            if offered_key_share.contains_group(req_group) {
                 return Err({
                     cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
@@ -1075,7 +1553,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         let key_share = match hrr.key_share {
-            Some(group) if group != offered_key_share.group() => {
+            Some(group) if !offered_key_share.contains_group(group) => {
                 if self
                     .next
                     .input
@@ -1089,16 +1567,12 @@ impl ExpectServerHelloOrHelloRetryRequest {
                             .into(),
                     ));
                 }
-
-                let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
-                    return Err(cx.common.send_fatal_alert(
+                tls13::retry_key_share(config, group, &mut cx.common.kx_state).map_err(|_| {
+                    cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
                         PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup,
-                    ));
-                };
-
-                cx.common.kx_state = KxState::Start(skxg);
-                skxg.start()?
+                    )
+                })?
             }
             _ => offered_key_share,
         };

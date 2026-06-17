@@ -356,10 +356,7 @@ fn minimal_client_hello() -> ClientHelloPayload {
         extensions: Box::new(ClientExtensions {
             signature_schemes: Some(vec![SignatureScheme::RSA_PSS_SHA256]),
             named_groups: Some(vec![NamedGroup::X25519, NamedGroup::secp256r1]),
-            supported_versions: Some(SupportedProtocolVersions {
-                tls12: true,
-                tls13: true,
-            }),
+            supported_versions: Some(SupportedProtocolVersions::from_flags(true, true)),
             key_shares: Some(vec![KeyShareEntry {
                 group: NamedGroup::X25519,
                 payload: PayloadU16::new(vec![0xab; 32]),
