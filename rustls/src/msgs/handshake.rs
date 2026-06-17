@@ -9,6 +9,7 @@ use core::{fmt, iter};
 
 use pki_types::{CertificateDer, DnsName};
 
+use crate::Error;
 #[cfg(feature = "tls12")]
 use crate::crypto::ActiveKeyExchange;
 use crate::crypto::SecureRandom;
@@ -946,6 +947,9 @@ extension_struct! {
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// Optional full order for extensions that are not forced to the final positions.
+        pub(crate) custom_order: Option<Vec<ExtensionType>>,
     }
 }
 
@@ -977,6 +981,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            custom_order,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1004,11 +1009,40 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            custom_order,
         }
     }
 
+    pub(crate) fn set_custom_order(&mut self, order: Vec<ExtensionType>) -> Result<(), Error> {
+        let mut required = self.collect_used();
+        required.retain(|ext| {
+            !matches!(
+                ext,
+                ExtensionType::PreSharedKey
+                    | ExtensionType::EncryptedClientHello
+                    | ExtensionType::EncryptedClientHelloOuterExtensions
+            ) && !self.contiguous_extensions.contains(ext)
+        });
+        required.sort_by_key(|ext| u16::from(*ext));
+
+        let mut provided = order.clone();
+        provided.sort_by_key(|ext| u16::from(*ext));
+
+        if required != provided {
+            return Err(Error::General(
+                "ClientHello extension order must contain every non-final emitted extension exactly once".into(),
+            ));
+        }
+
+        self.custom_order = Some(order);
+        Ok(())
+    }
+
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
-        let mut exts = self.order_insensitive_extensions_in_random_order();
+        let mut exts = match &self.custom_order {
+            Some(order) => order.clone(),
+            None => self.order_insensitive_extensions_in_random_order(),
+        };
         exts.extend(&self.contiguous_extensions);
 
         if self
@@ -1084,6 +1118,7 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
         }
 
         let mut checker = DuplicateExtensionChecker::new();
+        let mut order = Vec::new();
 
         let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
@@ -1095,8 +1130,21 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
             if typ == ExtensionType::PreSharedKey && sub.any_left() {
                 return Err(InvalidMessage::PreSharedKeyIsNotFinalExtension);
             }
+
+            if out.contains(typ)
+                && !matches!(
+                    typ,
+                    ExtensionType::PreSharedKey
+                        | ExtensionType::EncryptedClientHello
+                        | ExtensionType::EncryptedClientHelloOuterExtensions
+                )
+            {
+                order.push(typ);
+            }
         }
 
+        // Preserve observed non-final extension order for inspection and re-encoding.
+        out.custom_order = Some(order);
         Ok(out)
     }
 }

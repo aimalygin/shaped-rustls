@@ -434,6 +434,21 @@ fn emit_client_hello_for_retry(
         extensions: exts,
     };
 
+    if let Some(order) = input
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.extension_order.as_ref())
+    {
+        let order = order
+            .as_slice()
+            .iter()
+            .map(|extension| ExtensionType::from(extension.0))
+            .collect();
+        chp_payload
+            .extensions
+            .set_custom_order(order)?;
+    }
+
     let ech_grease_ext = config
         .ech_mode
         .as_ref()

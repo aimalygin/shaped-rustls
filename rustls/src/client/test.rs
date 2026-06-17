@@ -8,17 +8,18 @@ use std::sync::{Arc as StdArc, Mutex};
 use pki_types::{CertificateDer, ServerName};
 
 use crate::client::{
-    ClientConfig, ClientConnection, ClientHelloContext, ClientHelloCustomizer, ClientHelloPlan,
-    ClientHelloSessionId, Resumption, Tls12Resumption,
+    ClientConfig, ClientConnection, ClientHelloContext, ClientHelloCustomizer,
+    ClientHelloExtensionOrder, ClientHelloPlan, ClientHelloSessionId, Resumption, Tls12Resumption,
 };
 use crate::crypto::CryptoProvider;
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::Reader;
-use crate::msgs::enums::{Compression, NamedGroup};
+use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
-    ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, Random,
-    ServerHelloPayload, SessionId,
+    ClientExtensions, ClientHelloPayload, EncryptedClientHello, HandshakeMessagePayload,
+    HandshakePayload, HelloRetryRequest, Random, ServerHelloPayload, SessionId,
+    SupportedEcPointFormats,
 };
 use crate::msgs::message::{Message, MessagePayload, OutboundOpaqueMessage};
 use crate::sync::Arc;
@@ -162,6 +163,137 @@ mod tests {
         let emitted = client_hello_encoded_bytes_for_config(config).unwrap();
 
         assert_eq!(*captured.lock().unwrap(), emitted);
+    }
+
+    #[test]
+    fn client_hello_customizer_can_fix_extension_order() {
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_extension_order(order))),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(
+            ch.extensions
+                .used_extensions_in_encoding_order(),
+            vec![
+                ExtensionType::SupportedVersions,
+                ExtensionType::ServerName,
+                ExtensionType::SignatureAlgorithms,
+                ExtensionType::EllipticCurves,
+                ExtensionType::ECPointFormats,
+                ExtensionType::ExtendedMasterSecret,
+                ExtensionType::StatusRequest,
+                ExtensionType::KeyShare,
+                ExtensionType::PSKKeyExchangeModes,
+            ]
+        );
+    }
+
+    #[test]
+    fn client_extensions_custom_order_rejects_missing_emitted_extension() {
+        let mut extensions = ClientExtensions::default();
+        extensions.extended_master_secret_request = Some(());
+        extensions.ec_point_formats = Some(SupportedEcPointFormats::default());
+
+        assert!(
+            extensions
+                .set_custom_order(vec![ExtensionType::ExtendedMasterSecret])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn client_extensions_custom_order_rejects_extra_non_emitted_extension() {
+        let mut extensions = ClientExtensions::default();
+        extensions.extended_master_secret_request = Some(());
+
+        assert!(
+            extensions
+                .set_custom_order(vec![
+                    ExtensionType::ExtendedMasterSecret,
+                    ExtensionType::ECPointFormats,
+                ])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn client_extensions_custom_order_rejects_duplicate_extension() {
+        let mut extensions = ClientExtensions::default();
+        extensions.extended_master_secret_request = Some(());
+
+        assert!(
+            extensions
+                .set_custom_order(vec![
+                    ExtensionType::ExtendedMasterSecret,
+                    ExtensionType::ExtendedMasterSecret,
+                ])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn client_extensions_custom_order_rejects_forced_final_extension() {
+        let mut extensions = ClientExtensions::default();
+        extensions.extended_master_secret_request = Some(());
+        extensions.encrypted_client_hello = Some(EncryptedClientHello::Inner);
+
+        assert!(
+            extensions
+                .set_custom_order(vec![
+                    ExtensionType::ExtendedMasterSecret,
+                    ExtensionType::EncryptedClientHello,
+                ])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn client_extensions_custom_order_rejects_contiguous_extension_and_appends_it_once() {
+        let mut extensions = ClientExtensions::default();
+        extensions.extended_master_secret_request = Some(());
+        extensions.ec_point_formats = Some(SupportedEcPointFormats::default());
+        extensions
+            .contiguous_extensions
+            .push(ExtensionType::ECPointFormats);
+
+        assert!(
+            extensions
+                .set_custom_order(vec![
+                    ExtensionType::ExtendedMasterSecret,
+                    ExtensionType::ECPointFormats,
+                ])
+                .is_err()
+        );
+        extensions
+            .set_custom_order(vec![ExtensionType::ExtendedMasterSecret])
+            .unwrap();
+
+        assert_eq!(
+            extensions.used_extensions_in_encoding_order(),
+            vec![
+                ExtensionType::ExtendedMasterSecret,
+                ExtensionType::ECPointFormats,
+            ]
+        );
     }
 
     #[cfg(feature = "aws_lc_rs")]
