@@ -6,6 +6,31 @@
 Rustls is a modern TLS library written in Rust.
 </p>
 
+# shaped-rustls ClientHello shaping branch
+
+This branch is based on rustls `0.23.40` and adds opt-in ClientHello shaping
+support for xray/uTLS-compatible fingerprints.
+
+The default rustls behavior is intended to remain compatible with upstream when
+no `ClientHelloCustomizer` is configured. The shaping API is dormant unless an
+application explicitly installs a customizer on `ClientConfig`.
+
+This branch adds primitives for:
+
+* fixed ClientHello random and session ID values;
+* custom and advertised cipher suites;
+* supported versions, supported groups, and signature algorithm shaping;
+* custom extension ordering, disabling, forced/raw/exact extensions, and ALPS;
+* GREASE values and GREASE extension placement;
+* raw key shares and fixed X25519 key shares, including the classical X25519
+  component inside hybrid `X25519MLKEM768` key shares;
+* padding and raw ClientHello capture for byte-level verification.
+
+The release tag for this work is `xray-rustls-0.23.40-1`. The helper script
+`admin/check-clienthello-compat` compares the default ClientHello emitted by
+this checkout against the upstream rustls tag and normalizes only fields that
+must vary, such as random values and ephemeral key share bytes.
+
 # Status
 
 Rustls is used in production at many organizations and projects. We aim to maintain
