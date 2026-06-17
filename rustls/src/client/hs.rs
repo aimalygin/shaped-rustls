@@ -557,6 +557,179 @@ fn apply_raw_extension_plan(plan: Option<&ClientHelloPlan>, exts: &mut ClientExt
         .collect();
 }
 
+fn add_exact_extension_payload(
+    exts: &mut ClientExtensions<'_>,
+    extension_type: ExtensionType,
+    payload: Payload<'static>,
+) -> Result<(), Error> {
+    if exts.has_exact_extension(extension_type) {
+        return Err(Error::General(
+            "ClientHello exact extensions contain a duplicate extension".into(),
+        ));
+    }
+    if matches!(extension_type, ExtensionType::PreSharedKey) {
+        return Err(Error::General(
+            "ClientHello exact extension type cannot be pre_shared_key".into(),
+        ));
+    }
+
+    exts.exact_extensions
+        .push((extension_type, payload));
+    Ok(())
+}
+
+fn advertised_supported_versions_payload(
+    versions: &[ProtocolVersion],
+) -> Result<Payload<'static>, Error> {
+    let byte_len = versions
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| {
+            Error::General("ClientHello advertised supported versions are too large".into())
+        })?;
+    let byte_len = u8::try_from(byte_len).map_err(|_| {
+        Error::General("ClientHello advertised supported versions cannot exceed 254 bytes".into())
+    })?;
+    let mut payload = Vec::with_capacity(1 + usize::from(byte_len));
+    payload.push(byte_len);
+    for version in versions {
+        payload.extend_from_slice(&u16::from(*version).to_be_bytes());
+    }
+    Ok(Payload::new(payload))
+}
+
+fn advertised_supported_groups_payload(groups: &[NamedGroup]) -> Result<Payload<'static>, Error> {
+    let byte_len = groups
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| {
+            Error::General("ClientHello advertised supported groups are too large".into())
+        })?;
+    let byte_len = u16::try_from(byte_len).map_err(|_| {
+        Error::General("ClientHello advertised supported groups cannot exceed 65534 bytes".into())
+    })?;
+    let mut payload = Vec::with_capacity(2 + usize::from(byte_len));
+    payload.extend_from_slice(&byte_len.to_be_bytes());
+    for group in groups {
+        payload.extend_from_slice(&u16::from(*group).to_be_bytes());
+    }
+    Ok(Payload::new(payload))
+}
+
+fn apply_advertised_supported_versions_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+) -> Result<(), Error> {
+    let Some(versions) = plan.and_then(|plan| {
+        plan.advertised_supported_versions
+            .as_ref()
+    }) else {
+        return Ok(());
+    };
+
+    add_exact_extension_payload(
+        exts,
+        ExtensionType::SupportedVersions,
+        advertised_supported_versions_payload(versions.as_slice())?,
+    )
+}
+
+fn apply_advertised_supported_groups_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+) -> Result<(), Error> {
+    let Some(groups) = plan.and_then(|plan| {
+        plan.advertised_supported_groups
+            .as_ref()
+    }) else {
+        return Ok(());
+    };
+
+    add_exact_extension_payload(
+        exts,
+        ExtensionType::EllipticCurves,
+        advertised_supported_groups_payload(groups.as_slice())?,
+    )
+}
+
+fn apply_exact_extension_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+) -> Result<(), Error> {
+    let Some(exact_extensions) = plan.and_then(|plan| plan.exact_extensions.as_ref()) else {
+        return Ok(());
+    };
+
+    for extension in exact_extensions.as_slice() {
+        let extension_type = ExtensionType::from(extension.extension_type().0);
+        if matches!(extension_type, ExtensionType::EncryptedClientHello)
+            && exts.encrypted_client_hello.is_some()
+        {
+            return Err(Error::General(
+                "ClientHello exact encrypted_client_hello conflicts with managed ECH".into(),
+            ));
+        }
+        if matches!(
+            extension_type,
+            ExtensionType::EncryptedClientHelloOuterExtensions
+        ) && exts
+            .encrypted_client_hello_outer
+            .is_some()
+        {
+            return Err(Error::General(
+                "ClientHello exact encrypted_client_hello_outer conflicts with managed ECH".into(),
+            ));
+        }
+        add_exact_extension_payload(
+            exts,
+            extension_type,
+            Payload::new(extension.payload().to_vec()),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn apply_raw_key_share_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+) -> Result<(), Error> {
+    let Some(raw_key_shares) = plan.and_then(|plan| plan.raw_key_shares.as_ref()) else {
+        return Ok(());
+    };
+    let Some(key_shares) = exts.key_shares.as_mut() else {
+        return Err(Error::General(
+            "ClientHello raw key shares require a key_share extension".into(),
+        ));
+    };
+
+    for raw_key_share in raw_key_shares.as_slice() {
+        if key_shares
+            .iter()
+            .any(|key_share| key_share.group == raw_key_share.group())
+        {
+            return Err(Error::General(
+                "ClientHello raw key shares contain a duplicate group".into(),
+            ));
+        }
+
+        let entry = KeyShareEntry::new(raw_key_share.group(), raw_key_share.payload().to_vec());
+        match raw_key_share.position() {
+            Some(position) => {
+                if position > key_shares.len() {
+                    return Err(Error::General(
+                        "ClientHello raw key share position is out of range".into(),
+                    ));
+                }
+                key_shares.insert(position, entry);
+            }
+            None => key_shares.push(entry),
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_forced_extension_plan(plan: Option<&ClientHelloPlan>, exts: &mut ClientExtensions<'_>) {
     let Some(forced) = plan.and_then(|plan| plan.forced_extensions.as_ref()) else {
         return;
@@ -614,12 +787,16 @@ fn insert_at<T>(items: &mut Vec<T>, position: usize, value: T, what: &str) -> Re
 fn non_final_extension_count(exts: &ClientExtensions<'_>) -> usize {
     let mut order = exts.collect_used_with_raw();
     order.retain(|ext| {
-        !(matches!(
-            ext,
-            ExtensionType::PreSharedKey
-                | ExtensionType::EncryptedClientHello
-                | ExtensionType::EncryptedClientHelloOuterExtensions
-        ) || exts.contiguous_extensions.contains(ext))
+        !(matches!(ext, ExtensionType::PreSharedKey)
+            || matches!(ext, ExtensionType::EncryptedClientHello)
+                && exts.encrypted_client_hello.is_some()
+                && !exts.has_exact_extension(ExtensionType::EncryptedClientHello)
+            || matches!(ext, ExtensionType::EncryptedClientHelloOuterExtensions)
+                && exts
+                    .encrypted_client_hello_outer
+                    .is_some()
+                && !exts.has_exact_extension(ExtensionType::EncryptedClientHelloOuterExtensions)
+            || exts.contiguous_extensions.contains(ext))
     });
     order.len()
 }
@@ -941,6 +1118,10 @@ fn emit_client_hello_for_retry(
     )?;
     apply_forced_extension_plan(input.plan.as_ref(), &mut exts);
     apply_raw_extension_plan(input.plan.as_ref(), &mut exts);
+    apply_advertised_supported_versions_plan(input.plan.as_ref(), &mut exts)?;
+    apply_advertised_supported_groups_plan(input.plan.as_ref(), &mut exts)?;
+    apply_exact_extension_plan(input.plan.as_ref(), &mut exts)?;
+    apply_raw_key_share_plan(input.plan.as_ref(), &mut exts)?;
     apply_padding_plan(input.plan.as_ref(), &mut exts)?;
     apply_grease_plan(input.plan.as_ref(), &mut exts, &mut cipher_suites)?;
 
@@ -988,6 +1169,14 @@ fn emit_client_hello_for_retry(
             &chp_payload,
         )
     });
+    let has_exact_ech = chp_payload
+        .extensions
+        .has_exact_extension(ExtensionType::EncryptedClientHello);
+    if has_exact_ech && ech_state.is_some() {
+        return Err(Error::General(
+            "ClientHello exact encrypted_client_hello conflicts with managed ECH".into(),
+        ));
+    }
 
     match (cx.data.ech_status, &mut ech_state) {
         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
@@ -1004,14 +1193,16 @@ fn emit_client_hello_for_retry(
         // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
         // ECH.
         (EchStatus::NotOffered, None) => {
-            if let Some(grease_ext) = ech_grease_ext {
-                // Add the GREASE ECH extension.
-                let grease_ext = grease_ext?;
-                chp_payload.encrypted_client_hello = Some(grease_ext.clone());
-                cx.data.ech_status = EchStatus::Grease;
-                // Store the GREASE ECH extension in case we need to carry it forward in a
-                // subsequent hello.
-                input.prev_ech_ext = Some(grease_ext);
+            if !has_exact_ech {
+                if let Some(grease_ext) = ech_grease_ext {
+                    // Add the GREASE ECH extension.
+                    let grease_ext = grease_ext?;
+                    chp_payload.encrypted_client_hello = Some(grease_ext.clone());
+                    cx.data.ech_status = EchStatus::Grease;
+                    // Store the GREASE ECH extension in case we need to carry it forward in a
+                    // subsequent hello.
+                    input.prev_ech_ext = Some(grease_ext);
+                }
             }
         }
         _ => {}

@@ -1035,6 +1035,9 @@ extension_struct! {
         /// GREASE extensions inserted into the non-final ClientHello extension order.
         pub(crate) grease_extensions: Vec<(usize, ExtensionType, Payload<'static>)>,
 
+        /// Exact known extensions inserted into or overriding the ClientHello extension order.
+        pub(crate) exact_extensions: Vec<(ExtensionType, Payload<'static>)>,
+
         /// Raw unknown extensions inserted into the non-final ClientHello extension order.
         pub(crate) raw_extensions: Vec<(ExtensionType, Payload<'static>)>,
     }
@@ -1083,6 +1086,7 @@ impl ClientExtensions<'_> {
             contiguous_extensions,
             custom_order,
             grease_extensions,
+            exact_extensions,
             raw_extensions,
         } = self;
         ClientExtensions {
@@ -1115,12 +1119,18 @@ impl ClientExtensions<'_> {
             contiguous_extensions,
             custom_order,
             grease_extensions,
+            exact_extensions,
             raw_extensions,
         }
     }
 
     pub(crate) fn collect_used_with_raw(&self) -> Vec<ExtensionType> {
         let mut used = self.collect_used();
+        for (extension_type, _) in &self.exact_extensions {
+            if !used.contains(extension_type) {
+                used.push(*extension_type);
+            }
+        }
         used.extend(
             self.raw_extensions
                 .iter()
@@ -1129,15 +1139,32 @@ impl ClientExtensions<'_> {
         used
     }
 
+    pub(crate) fn has_exact_extension(&self, extension_type: ExtensionType) -> bool {
+        self.exact_extensions
+            .iter()
+            .any(|(typ, _)| *typ == extension_type)
+    }
+
+    fn is_final_extension(&self, extension_type: ExtensionType) -> bool {
+        match extension_type {
+            ExtensionType::PreSharedKey => self.preshared_key_offer.is_some(),
+            ExtensionType::EncryptedClientHello => {
+                self.encrypted_client_hello.is_some()
+                    && !self.has_exact_extension(ExtensionType::EncryptedClientHello)
+            }
+            ExtensionType::EncryptedClientHelloOuterExtensions => {
+                self.encrypted_client_hello_outer
+                    .is_some()
+                    && !self.has_exact_extension(ExtensionType::EncryptedClientHelloOuterExtensions)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn set_custom_order(&mut self, order: Vec<ExtensionType>) -> Result<(), Error> {
         let mut required = self.collect_used_with_raw();
         required.retain(|ext| {
-            !matches!(
-                ext,
-                ExtensionType::PreSharedKey
-                    | ExtensionType::EncryptedClientHello
-                    | ExtensionType::EncryptedClientHelloOuterExtensions
-            ) && !self.contiguous_extensions.contains(ext)
+            !self.is_final_extension(*ext) && !self.contiguous_extensions.contains(ext)
         });
         required.sort_by_key(|ext| u16::from(*ext));
 
@@ -1165,10 +1192,13 @@ impl ClientExtensions<'_> {
         if self
             .encrypted_client_hello_outer
             .is_some()
+            && !self.has_exact_extension(ExtensionType::EncryptedClientHelloOuterExtensions)
         {
             exts.push(ExtensionType::EncryptedClientHelloOuterExtensions);
         }
-        if self.encrypted_client_hello.is_some() {
+        if self.encrypted_client_hello.is_some()
+            && !self.has_exact_extension(ExtensionType::EncryptedClientHello)
+        {
             exts.push(ExtensionType::EncryptedClientHello);
         }
         if self.preshared_key_offer.is_some() {
@@ -1195,12 +1225,7 @@ impl ClientExtensions<'_> {
 
         // Remove extensions which have specific order requirements.
         order.retain(|ext| {
-            !(matches!(
-                ext,
-                ExtensionType::PreSharedKey
-                    | ExtensionType::EncryptedClientHello
-                    | ExtensionType::EncryptedClientHelloOuterExtensions
-            ) || self.contiguous_extensions.contains(ext))
+            !self.is_final_extension(*ext) && !self.contiguous_extensions.contains(ext)
         });
 
         order.sort_by_cached_key(|new_ext| {
@@ -1209,6 +1234,12 @@ impl ClientExtensions<'_> {
         });
 
         order
+    }
+
+    fn exact_extension_payload(&self, item: ExtensionType) -> Option<&Payload<'static>> {
+        self.exact_extensions
+            .iter()
+            .find_map(|(extension_type, payload)| (*extension_type == item).then_some(payload))
     }
 
     fn raw_extension_payload(&self, item: ExtensionType) -> Option<&Payload<'static>> {
@@ -1235,6 +1266,10 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         for item in order {
             if let Some(payload) = self.grease_extension_payload(item) {
+                item.encode(body.buf);
+                (payload.bytes().len() as u16).encode(body.buf);
+                payload.encode(body.buf);
+            } else if let Some(payload) = self.exact_extension_payload(item) {
                 item.encode(body.buf);
                 (payload.bytes().len() as u16).encode(body.buf);
                 payload.encode(body.buf);

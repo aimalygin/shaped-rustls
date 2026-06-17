@@ -601,12 +601,15 @@ pub mod client {
     #[cfg(feature = "std")]
     pub use client_conn::{ClientConnection, WriteEarlyData};
     pub use client_hello::{
-        CapturesClientHello, ClientHelloAdvertisedCipherSuites, ClientHelloAlpnProtocols,
-        ClientHelloCertificateCompressionAlgorithms, ClientHelloCipherSuites, ClientHelloContext,
-        ClientHelloCustomizer, ClientHelloExtensionOrder, ClientHelloExtensionPlan,
-        ClientHelloExtensionType, ClientHelloForcedExtensions, ClientHelloGreaseExtension,
-        ClientHelloGreasePlan, ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan,
-        ClientHelloRawExtension, ClientHelloRawExtensions, ClientHelloSessionId,
+        CapturesClientHello, ClientHelloAdvertisedCipherSuites,
+        ClientHelloAdvertisedSupportedGroups, ClientHelloAdvertisedSupportedVersions,
+        ClientHelloAlpnProtocols, ClientHelloCertificateCompressionAlgorithms,
+        ClientHelloCipherSuites, ClientHelloContext, ClientHelloCustomizer,
+        ClientHelloExactExtension, ClientHelloExactExtensions, ClientHelloExtensionOrder,
+        ClientHelloExtensionPlan, ClientHelloExtensionType, ClientHelloForcedExtensions,
+        ClientHelloGreaseExtension, ClientHelloGreasePlan, ClientHelloKeySharePlan,
+        ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension, ClientHelloRawExtensions,
+        ClientHelloRawKeyShare, ClientHelloRawKeyShares, ClientHelloSessionId,
         ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups, ClientHelloSupportedVersions,
         FixedX25519KeyShare, ObservesX25519KeyShare,
     };

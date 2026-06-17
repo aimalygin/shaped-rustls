@@ -335,6 +335,16 @@ where
     Ok(())
 }
 
+fn reject_empty<T>(values: &[T], what: &str) -> Result<(), Error> {
+    if values.is_empty() {
+        return Err(Error::General(
+            format!("ClientHello {what} cannot be empty").into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Explicit cipher suite list and order for the ClientHello.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHelloCipherSuites(Vec<CipherSuite>);
@@ -399,6 +409,35 @@ impl TryFrom<Vec<CipherSuite>> for ClientHelloAdvertisedCipherSuites {
     }
 }
 
+/// Explicit advertised TLS supported_versions list and order.
+///
+/// This affects only the serialized ClientHello extension body. It does not
+/// enable protocol versions that are not enabled in the rustls config.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloAdvertisedSupportedVersions(Vec<ProtocolVersion>);
+
+impl ClientHelloAdvertisedSupportedVersions {
+    /// Return the ordered advertised supported versions.
+    pub fn as_slice(&self) -> &[ProtocolVersion] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<ProtocolVersion>> for ClientHelloAdvertisedSupportedVersions {
+    type Error = Error;
+
+    fn try_from(value: Vec<ProtocolVersion>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "advertised supported versions")?;
+        if value.len() > usize::from(u8::MAX) / 2 {
+            return Err(Error::General(
+                "ClientHello advertised supported versions cannot exceed 254 bytes".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
 /// Explicit TLS supported_versions list and order for the ClientHello.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHelloSupportedVersions(Vec<ProtocolVersion>);
@@ -421,6 +460,35 @@ impl TryFrom<Vec<ProtocolVersion>> for ClientHelloSupportedVersions {
         {
             return Err(Error::General(
                 "ClientHello supported versions can only contain TLS 1.2 and TLS 1.3".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit advertised supported_groups list and order.
+///
+/// This affects only the serialized ClientHello extension body. It does not add
+/// key exchange implementations to the configured crypto provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloAdvertisedSupportedGroups(Vec<NamedGroup>);
+
+impl ClientHelloAdvertisedSupportedGroups {
+    /// Return the ordered advertised supported groups.
+    pub fn as_slice(&self) -> &[NamedGroup] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<NamedGroup>> for ClientHelloAdvertisedSupportedGroups {
+    type Error = Error;
+
+    fn try_from(value: Vec<NamedGroup>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "advertised supported groups")?;
+        if value.len() > usize::from(u16::MAX) / 2 {
+            return Err(Error::General(
+                "ClientHello advertised supported groups cannot exceed 65534 bytes".into(),
             ));
         }
 
@@ -486,6 +554,102 @@ impl TryFrom<Vec<NamedGroup>> for ClientHelloKeySharePlan {
     }
 }
 
+/// A raw key_share entry added to the serialized ClientHello.
+///
+/// This affects only the key_share extension bytes. It does not add a key
+/// exchange implementation to the configured crypto provider, so peers cannot
+/// successfully negotiate a raw-only group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloRawKeyShare {
+    group: NamedGroup,
+    payload: Vec<u8>,
+    position: Option<usize>,
+}
+
+impl ClientHelloRawKeyShare {
+    /// Create a raw key_share entry appended after rustls-generated shares.
+    pub fn new(group: NamedGroup, payload: Vec<u8>) -> Result<Self, Error> {
+        Self::new_inner(group, payload, None)
+    }
+
+    /// Insert a raw key_share entry at `position` in the key_share list.
+    pub fn new_at(position: usize, group: NamedGroup, payload: Vec<u8>) -> Result<Self, Error> {
+        Self::new_inner(group, payload, Some(position))
+    }
+
+    fn new_inner(
+        group: NamedGroup,
+        payload: Vec<u8>,
+        position: Option<usize>,
+    ) -> Result<Self, Error> {
+        if payload.is_empty() {
+            return Err(Error::General(
+                "ClientHello raw key share payload cannot be empty".into(),
+            ));
+        }
+        if payload.len() > usize::from(u16::MAX) {
+            return Err(Error::General(
+                "ClientHello raw key share payload cannot exceed 65535 bytes".into(),
+            ));
+        }
+
+        Ok(Self {
+            group,
+            payload,
+            position,
+        })
+    }
+
+    /// Return the advertised key_share group.
+    pub fn group(&self) -> NamedGroup {
+        self.group
+    }
+
+    /// Return the key_share payload bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Return the insertion position, or `None` when appended.
+    pub fn position(&self) -> Option<usize> {
+        self.position
+    }
+}
+
+/// Raw key_share entries added to the serialized ClientHello.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloRawKeyShares(Vec<ClientHelloRawKeyShare>);
+
+impl ClientHelloRawKeyShares {
+    /// Return the raw key_share list.
+    pub fn as_slice(&self) -> &[ClientHelloRawKeyShare] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<ClientHelloRawKeyShare>> for ClientHelloRawKeyShares {
+    type Error = Error;
+
+    fn try_from(value: Vec<ClientHelloRawKeyShare>) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(Error::General(
+                "ClientHello raw key shares cannot be empty".into(),
+            ));
+        }
+
+        let mut seen = BTreeSet::new();
+        for key_share in &value {
+            if !seen.insert(u16::from(key_share.group)) {
+                return Err(Error::General(
+                    "ClientHello raw key shares contain a duplicate group".into(),
+                ));
+            }
+        }
+
+        Ok(Self(value))
+    }
+}
+
 /// Explicit signature_algorithms list and order for the ClientHello.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHelloSignatureAlgorithms(Vec<SignatureScheme>);
@@ -501,7 +665,7 @@ impl TryFrom<Vec<SignatureScheme>> for ClientHelloSignatureAlgorithms {
     type Error = Error;
 
     fn try_from(value: Vec<SignatureScheme>) -> Result<Self, Self::Error> {
-        reject_empty_and_duplicate_keys(&value, u16::from, "signature algorithms")?;
+        reject_empty(&value, "signature algorithms")?;
         if value
             .iter()
             .any(|scheme| matches!(scheme, SignatureScheme::Unknown(_)))
@@ -539,6 +703,97 @@ impl TryFrom<Vec<CertificateCompressionAlgorithm>> for ClientHelloCertificateCom
                 "ClientHello certificate compression algorithms cannot contain unknown values"
                     .into(),
             ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// A bounded exact known ClientHello extension payload.
+///
+/// This escape hatch is for byte-level ClientHello shaping of extension types
+/// rustls knows about. Unknown extension types should use
+/// [`ClientHelloRawExtension`], and GREASE extension slots should use
+/// [`ClientHelloGreasePlan`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloExactExtension {
+    extension_type: ClientHelloExtensionType,
+    payload: Vec<u8>,
+}
+
+impl ClientHelloExactExtension {
+    /// Create an exact known ClientHello extension payload.
+    pub fn new(extension_type: u16, payload: Vec<u8>) -> Result<Self, Error> {
+        if payload.len() > usize::from(u16::MAX) {
+            return Err(Error::General(
+                "ClientHello exact extension payload cannot exceed 65535 bytes".into(),
+            ));
+        }
+        if is_grease_value(extension_type) {
+            return Err(Error::General(
+                "ClientHello exact extension type cannot be a GREASE value".into(),
+            ));
+        }
+
+        match ExtensionType::from(extension_type) {
+            ExtensionType::Unknown(_) => {
+                return Err(Error::General(
+                    "ClientHello exact extension type must be known".into(),
+                ));
+            }
+            ExtensionType::PreSharedKey => {
+                return Err(Error::General(
+                    "ClientHello exact extension type cannot be pre_shared_key".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            extension_type: ClientHelloExtensionType(extension_type),
+            payload,
+        })
+    }
+
+    /// Return the extension type.
+    pub fn extension_type(&self) -> ClientHelloExtensionType {
+        self.extension_type
+    }
+
+    /// Return the exact extension body bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// Exact known ClientHello extension payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloExactExtensions(Vec<ClientHelloExactExtension>);
+
+impl ClientHelloExactExtensions {
+    /// Return the exact extension list.
+    pub fn as_slice(&self) -> &[ClientHelloExactExtension] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<ClientHelloExactExtension>> for ClientHelloExactExtensions {
+    type Error = Error;
+
+    fn try_from(value: Vec<ClientHelloExactExtension>) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(Error::General(
+                "ClientHello exact extensions cannot be empty".into(),
+            ));
+        }
+
+        let mut seen = BTreeSet::new();
+        for extension in &value {
+            if !seen.insert(extension.extension_type.0) {
+                return Err(Error::General(
+                    "ClientHello exact extensions contain a duplicate extension".into(),
+                ));
+            }
         }
 
         Ok(Self(value))
@@ -906,12 +1161,16 @@ pub struct ClientHelloPlan {
     pub(crate) alpn_protocols: Option<ClientHelloAlpnProtocols>,
     pub(crate) cipher_suites: Option<ClientHelloCipherSuites>,
     pub(crate) advertised_cipher_suites: Option<ClientHelloAdvertisedCipherSuites>,
+    pub(crate) advertised_supported_versions: Option<ClientHelloAdvertisedSupportedVersions>,
     pub(crate) supported_versions: Option<ClientHelloSupportedVersions>,
+    pub(crate) advertised_supported_groups: Option<ClientHelloAdvertisedSupportedGroups>,
     pub(crate) supported_groups: Option<ClientHelloSupportedGroups>,
     pub(crate) key_share_plan: Option<ClientHelloKeySharePlan>,
+    pub(crate) raw_key_shares: Option<ClientHelloRawKeyShares>,
     pub(crate) signature_algorithms: Option<ClientHelloSignatureAlgorithms>,
     pub(crate) certificate_compression_algorithms:
         Option<ClientHelloCertificateCompressionAlgorithms>,
+    pub(crate) exact_extensions: Option<ClientHelloExactExtensions>,
     pub(crate) raw_extensions: Option<ClientHelloRawExtensions>,
     pub(crate) grease: Option<ClientHelloGreasePlan>,
     pub(crate) grease_ech: Option<EchGreaseConfig>,
@@ -992,9 +1251,33 @@ impl ClientHelloPlan {
         self
     }
 
+    /// Use an explicit advertised supported_versions list and order.
+    ///
+    /// This affects only the serialized ClientHello extension. It does not
+    /// enable protocol versions that are not enabled in the rustls config.
+    pub fn with_advertised_supported_versions(
+        mut self,
+        versions: ClientHelloAdvertisedSupportedVersions,
+    ) -> Self {
+        self.advertised_supported_versions = Some(versions);
+        self
+    }
+
     /// Use an explicit supported_versions list and order.
     pub fn with_supported_versions(mut self, versions: ClientHelloSupportedVersions) -> Self {
         self.supported_versions = Some(versions);
+        self
+    }
+
+    /// Use an explicit advertised supported_groups list and order.
+    ///
+    /// This affects only the serialized ClientHello extension. It does not add
+    /// key exchange implementations to the configured crypto provider.
+    pub fn with_advertised_supported_groups(
+        mut self,
+        groups: ClientHelloAdvertisedSupportedGroups,
+    ) -> Self {
+        self.advertised_supported_groups = Some(groups);
         self
     }
 
@@ -1007,6 +1290,12 @@ impl ClientHelloPlan {
     /// Use an explicit key_share group list and order.
     pub fn with_key_share_plan(mut self, key_share_plan: ClientHelloKeySharePlan) -> Self {
         self.key_share_plan = Some(key_share_plan);
+        self
+    }
+
+    /// Add raw key_share entries to the serialized ClientHello.
+    pub fn with_raw_key_shares(mut self, key_shares: ClientHelloRawKeyShares) -> Self {
+        self.raw_key_shares = Some(key_shares);
         self
     }
 
@@ -1025,6 +1314,12 @@ impl ClientHelloPlan {
         algorithms: ClientHelloCertificateCompressionAlgorithms,
     ) -> Self {
         self.certificate_compression_algorithms = Some(algorithms);
+        self
+    }
+
+    /// Add exact known ClientHello extension payloads.
+    pub fn with_exact_extensions(mut self, extensions: ClientHelloExactExtensions) -> Self {
+        self.exact_extensions = Some(extensions);
         self
     }
 
