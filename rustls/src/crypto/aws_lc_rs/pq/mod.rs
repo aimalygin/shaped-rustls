@@ -1,8 +1,10 @@
+use alloc::boxed::Box;
+
 use aws_lc_rs::kem;
 
-use crate::crypto::SupportedKxGroup;
 use crate::crypto::aws_lc_rs::kx_group;
 use crate::crypto::aws_lc_rs::pq::mlkem::MlKem;
+use crate::crypto::{ActiveKeyExchange, SupportedKxGroup};
 use crate::{Error, NamedGroup, PeerMisbehaved};
 
 mod hybrid;
@@ -11,7 +13,7 @@ mod mlkem;
 /// This is the [X25519MLKEM768] key exchange.
 ///
 /// [X25519MLKEM768]: <https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/>
-pub static X25519MLKEM768: &dyn SupportedKxGroup = &hybrid::Hybrid {
+static X25519MLKEM768_INNER: hybrid::Hybrid = hybrid::Hybrid {
     classical: kx_group::X25519,
     post_quantum: MLKEM768,
     name: NamedGroup::X25519MLKEM768,
@@ -37,6 +39,18 @@ pub static SECP256R1MLKEM768: &dyn SupportedKxGroup = &hybrid::Hybrid {
         post_quantum_first: false,
     },
 };
+
+/// This is the [X25519MLKEM768] key exchange.
+///
+/// [X25519MLKEM768]: <https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/>
+pub static X25519MLKEM768: &dyn SupportedKxGroup = &X25519MLKEM768_INNER;
+
+pub(crate) fn start_x25519mlkem768_with_fixed_x25519(
+    private_key: &[u8; 32],
+) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+    let classical = crate::crypto::aws_lc_rs::x25519::start_fixed_x25519(private_key)?;
+    X25519MLKEM768_INNER.start_with_classical(classical)
+}
 
 /// This is the [MLKEM] key encapsulation mechanism in NIST with security category 3.
 ///

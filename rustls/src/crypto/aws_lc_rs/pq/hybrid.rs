@@ -15,11 +15,18 @@ pub(crate) struct Hybrid {
     pub(crate) layout: Layout,
 }
 
-impl SupportedKxGroup for Hybrid {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-        let classical = self.classical.start()?;
-        let post_quantum = self.post_quantum.start()?;
+impl Hybrid {
+    pub(crate) fn start_with_classical(
+        &self,
+        classical: Box<dyn ActiveKeyExchange>,
+    ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        if classical.group() != self.classical.name() {
+            return Err(Error::General(
+                "hybrid key exchange fixed classical component has the wrong group".into(),
+            ));
+        }
 
+        let post_quantum = self.post_quantum.start()?;
         let combined_pub_key = self
             .layout
             .concat(post_quantum.pub_key(), classical.pub_key());
@@ -31,6 +38,13 @@ impl SupportedKxGroup for Hybrid {
             layout: self.layout,
             combined_pub_key,
         }))
+    }
+}
+
+impl SupportedKxGroup for Hybrid {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        let classical = self.classical.start()?;
+        self.start_with_classical(classical)
     }
 
     fn start_and_complete(&self, client_share: &[u8]) -> Result<CompletedKeyExchange, Error> {

@@ -60,6 +60,7 @@ struct ExpectServerHello {
     //
     // If this is `None` then we do not support early data.
     early_data_key_schedule: Option<KeyScheduleEarly>,
+    offered_cipher_suites: Vec<CipherSuite>,
     offered_key_share: Option<tls13::OfferedKeyShares>,
     suite: Option<SupportedCipherSuite>,
     ech_state: Option<EchState>,
@@ -132,7 +133,8 @@ impl ClientHelloInput {
 
         let plan = match config.client_hello_customizer.as_ref() {
             Some(customizer) => {
-                let forbids_tls12 = cx.common.is_quic() || config.ech_mode.is_some();
+                let forbids_tls12 =
+                    cx.common.is_quic() || matches!(config.ech_mode, Some(EchMode::Enable(_)));
                 let versions: Vec<_> = versions::ALL_VERSIONS
                     .iter()
                     .copied()
@@ -868,8 +870,18 @@ fn emit_client_hello_for_retry(
         .plan
         .as_ref()
         .and_then(|plan| plan.cipher_suites.as_ref());
-    let mut cipher_suites: Vec<_> = match custom_cipher_suites {
-        Some(cipher_suites) => {
+    let advertised_cipher_suites = input
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.advertised_cipher_suites.as_ref());
+    if custom_cipher_suites.is_some() && advertised_cipher_suites.is_some() {
+        return Err(Error::General(
+            "ClientHello cannot set both cipher suites and advertised cipher suites".into(),
+        ));
+    }
+
+    let mut cipher_suites: Vec<_> = match (custom_cipher_suites, advertised_cipher_suites) {
+        (Some(cipher_suites), None) => {
             validate_cipher_suites(
                 cipher_suites.as_slice(),
                 config,
@@ -878,7 +890,8 @@ fn emit_client_hello_for_retry(
             )?;
             cipher_suites.as_slice().to_vec()
         }
-        None => config
+        (None, Some(cipher_suites)) => cipher_suites.as_slice().to_vec(),
+        (None, None) => config
             .provider
             .cipher_suites
             .iter()
@@ -887,9 +900,13 @@ fn emit_client_hello_for_retry(
                 false => None,
             })
             .collect(),
+        (Some(_), Some(_)) => unreachable!(),
     };
 
-    if custom_cipher_suites.is_none() && supported_versions.tls12 {
+    if custom_cipher_suites.is_none()
+        && advertised_cipher_suites.is_none()
+        && supported_versions.tls12
+    {
         // We don't do renegotiation at all, in fact.
         cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
     }
@@ -930,17 +947,26 @@ fn emit_client_hello_for_retry(
             .set_custom_order(order)?;
     }
 
-    let ech_grease_ext = config
-        .ech_mode
+    let ech_grease_config = input
+        .plan
         .as_ref()
-        .and_then(|mode| match mode {
-            EchMode::Grease(cfg) => Some(cfg.grease_ext(
-                config.provider.secure_random,
-                input.server_name.clone(),
-                &chp_payload,
-            )),
-            _ => None,
+        .and_then(|plan| plan.grease_ech.as_ref())
+        .or_else(|| {
+            config
+                .ech_mode
+                .as_ref()
+                .and_then(|mode| match mode {
+                    EchMode::Grease(cfg) => Some(cfg),
+                    _ => None,
+                })
         });
+    let ech_grease_ext = ech_grease_config.map(|cfg| {
+        cfg.grease_ext(
+            config.provider.secure_random,
+            input.server_name.clone(),
+            &chp_payload,
+        )
+    });
 
     match (cx.data.ech_status, &mut ech_state) {
         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
@@ -976,6 +1002,7 @@ fn emit_client_hello_for_retry(
     input.hello.sent_extensions = chp_payload
         .extensions
         .collect_used_with_raw();
+    let offered_cipher_suites = chp_payload.cipher_suites.clone();
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
 
@@ -1068,6 +1095,7 @@ fn emit_client_hello_for_retry(
         input,
         transcript_buffer,
         early_data_key_schedule,
+        offered_cipher_suites,
         offered_key_share: key_share,
         suite,
         ech_state,
@@ -1323,6 +1351,18 @@ impl State<ClientConnectionData> for ExpectServerHello {
             }
         }
 
+        if !self
+            .offered_cipher_suites
+            .contains(&server_hello.cipher_suite)
+        {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    PeerMisbehaved::SelectedUnofferedCipherSuite,
+                )
+            });
+        }
+
         let suite = config
             .find_cipher_suite(server_hello.cipher_suite)
             .ok_or_else(|| {
@@ -1494,6 +1534,19 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         // Or asks us to use a ciphersuite we didn't offer.
+        if !self
+            .next
+            .offered_cipher_suites
+            .contains(&hrr.cipher_suite)
+        {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite,
+                )
+            });
+        }
+
         let Some(cs) = config.find_cipher_suite(hrr.cipher_suite) else {
             return Err({
                 cx.common.send_fatal_alert(

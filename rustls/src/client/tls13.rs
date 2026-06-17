@@ -449,25 +449,6 @@ fn planned_key_shares(
     plan: Option<&ClientHelloPlan>,
     groups: &[NamedGroup],
 ) -> Result<OfferedKeyShares, Error> {
-    if let Some(fixed_x25519) = plan.and_then(|plan| plan.fixed_x25519.as_ref()) {
-        if groups != [NamedGroup::X25519] {
-            return Err(Error::General(
-                "fixed X25519 key share requires a single X25519 key_share group".into(),
-            ));
-        }
-        let group = config
-            .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
-            .ok_or_else(|| {
-                Error::General("ClientHello key share group is not supported by this config".into())
-            })?;
-        let key_exchange = start_fixed_x25519_key_share(group, fixed_x25519)?;
-        *kx_state = KxState::Start(group);
-        return Ok(OfferedKeyShares {
-            exchanges: vec![key_exchange],
-            offered_groups: groups.to_vec(),
-        });
-    }
-
     if let Some(supported_groups) = plan.and_then(|plan| plan.supported_groups.as_ref()) {
         for group in groups {
             if !supported_groups
@@ -490,7 +471,7 @@ fn planned_key_shares(
         if offered.covers_group(*group) {
             continue;
         }
-        let key_exchange = start_key_exchange_for_named_group(config, *group)?;
+        let key_exchange = start_key_exchange_for_group(config, *group, plan)?;
         offered.exchanges.push(key_exchange);
     }
 
@@ -542,18 +523,37 @@ fn start_fixed_x25519_key_share(
     group: &'static dyn SupportedKxGroup,
     fixed_x25519: &crate::client::FixedX25519KeyShare,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-    if group.name() != NamedGroup::X25519 {
+    if !matches!(
+        group.name(),
+        NamedGroup::X25519 | NamedGroup::X25519MLKEM768
+    ) {
         return Err(Error::General(
-            "fixed X25519 key share requires X25519 to be the selected group".into(),
+            "fixed X25519 key share requires X25519 or X25519MLKEM768 to be the selected group"
+                .into(),
         ));
     }
 
     #[cfg(feature = "aws_lc_rs")]
     {
         if !core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519) {
-            return Err(Error::General(
-                "fixed X25519 key share requires aws-lc X25519 to be the selected group".into(),
-            ));
+            if core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519MLKEM768) {
+                let key_exchange = crypto::aws_lc_rs::pq::start_x25519mlkem768_with_fixed_x25519(
+                    fixed_x25519.private_key(),
+                )?;
+                if let Some((NamedGroup::X25519, public_key)) = key_exchange.hybrid_component() {
+                    let public_key: &[u8; 32] = public_key.try_into().map_err(|_| {
+                        Error::General("fixed X25519 public key was not 32 bytes".into())
+                    })?;
+                    if let Some(observer) = fixed_x25519.observer() {
+                        observer.observe_x25519_key_share(public_key)?;
+                    }
+                }
+                return Ok(key_exchange);
+            } else {
+                return Err(Error::General(
+                    "fixed X25519 key share requires aws-lc X25519 or X25519MLKEM768 to be the selected group".into(),
+                ));
+            }
         }
 
         let key_exchange =

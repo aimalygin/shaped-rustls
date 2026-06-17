@@ -5,6 +5,7 @@ use core::fmt;
 
 use pki_types::ServerName;
 
+use super::ech::EchGreaseConfig;
 use crate::crypto::CryptoProvider;
 use crate::enums::{
     CertificateCompressionAlgorithm, CipherSuite, ProtocolVersion, SignatureScheme,
@@ -311,6 +312,41 @@ impl TryFrom<Vec<CipherSuite>> for ClientHelloCipherSuites {
         {
             return Err(Error::General(
                 "ClientHello cipher suites cannot contain unknown values".into(),
+            ));
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Explicit advertised cipher suite list and order for the ClientHello.
+///
+/// Unlike [`ClientHelloCipherSuites`], this list is used only for the
+/// serialized ClientHello. It may include known cipher suite identifiers that
+/// the configured crypto provider does not implement, so it is intended for
+/// fingerprint compatibility only. The negotiated cipher suite must still be
+/// implemented by the configured provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloAdvertisedCipherSuites(Vec<CipherSuite>);
+
+impl ClientHelloAdvertisedCipherSuites {
+    /// Return the ordered advertised cipher suite list.
+    pub fn as_slice(&self) -> &[CipherSuite] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<CipherSuite>> for ClientHelloAdvertisedCipherSuites {
+    type Error = Error;
+
+    fn try_from(value: Vec<CipherSuite>) -> Result<Self, Self::Error> {
+        reject_empty_and_duplicate_keys(&value, u16::from, "advertised cipher suites")?;
+        if value
+            .iter()
+            .any(|suite| matches!(suite, CipherSuite::Unknown(_)))
+        {
+            return Err(Error::General(
+                "ClientHello advertised cipher suites cannot contain unknown values".into(),
             ));
         }
 
@@ -755,6 +791,7 @@ pub struct ClientHelloPlan {
     pub(crate) extensions: Option<ClientHelloExtensionPlan>,
     pub(crate) alpn_protocols: Option<ClientHelloAlpnProtocols>,
     pub(crate) cipher_suites: Option<ClientHelloCipherSuites>,
+    pub(crate) advertised_cipher_suites: Option<ClientHelloAdvertisedCipherSuites>,
     pub(crate) supported_versions: Option<ClientHelloSupportedVersions>,
     pub(crate) supported_groups: Option<ClientHelloSupportedGroups>,
     pub(crate) key_share_plan: Option<ClientHelloKeySharePlan>,
@@ -763,6 +800,7 @@ pub struct ClientHelloPlan {
         Option<ClientHelloCertificateCompressionAlgorithms>,
     pub(crate) raw_extensions: Option<ClientHelloRawExtensions>,
     pub(crate) grease: Option<ClientHelloGreasePlan>,
+    pub(crate) grease_ech: Option<EchGreaseConfig>,
     pub(crate) padding: Option<ClientHelloPaddingPlan>,
 }
 
@@ -822,6 +860,18 @@ impl ClientHelloPlan {
         self
     }
 
+    /// Use an explicit advertised cipher suite list and order.
+    ///
+    /// This affects only the serialized ClientHello. It does not add cipher
+    /// suite implementations to the configured crypto provider.
+    pub fn with_advertised_cipher_suites(
+        mut self,
+        cipher_suites: ClientHelloAdvertisedCipherSuites,
+    ) -> Self {
+        self.advertised_cipher_suites = Some(cipher_suites);
+        self
+    }
+
     /// Use an explicit supported_versions list and order.
     pub fn with_supported_versions(mut self, versions: ClientHelloSupportedVersions) -> Self {
         self.supported_versions = Some(versions);
@@ -867,6 +917,15 @@ impl ClientHelloPlan {
     /// Use explicit GREASE insertion controls.
     pub fn with_grease(mut self, grease: ClientHelloGreasePlan) -> Self {
         self.grease = Some(grease);
+        self
+    }
+
+    /// Add a GREASE encrypted_client_hello extension.
+    ///
+    /// This is a per-ClientHello shaping control and does not enable real ECH
+    /// for the connection.
+    pub fn with_grease_ech(mut self, grease_ech: EchGreaseConfig) -> Self {
+        self.grease_ech = Some(grease_ech);
         self
     }
 
