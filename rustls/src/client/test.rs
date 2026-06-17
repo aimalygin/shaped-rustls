@@ -3,10 +3,14 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc as StdArc, Mutex};
 
 use pki_types::{CertificateDer, ServerName};
 
-use crate::client::{ClientConfig, ClientConnection, Resumption, Tls12Resumption};
+use crate::client::{
+    ClientConfig, ClientConnection, ClientHelloContext, ClientHelloCustomizer, ClientHelloPlan,
+    ClientHelloSessionId, Resumption, Tls12Resumption,
+};
 use crate::crypto::CryptoProvider;
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::msgs::base::PayloadU16;
@@ -95,6 +99,74 @@ mod tests {
                 "sha1 unexpectedly offered"
             );
         }
+    }
+
+    #[test]
+    fn client_hello_customizer_can_fix_random() {
+        let fixed_random = [0x42u8; 32];
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_random(fixed_random))),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(ch.random, Random::from(fixed_random));
+    }
+
+    #[test]
+    fn client_hello_customizer_can_fix_session_id() {
+        let session_id = vec![0x11, 0x22, 0x33, 0x44];
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_session_id(ClientHelloSessionId::try_from(session_id.clone()).unwrap()),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(ch.session_id.as_ref(), session_id.as_slice());
+    }
+
+    #[test]
+    fn client_hello_customizer_captures_raw_client_hello() {
+        let captured = StdArc::new(Mutex::new(Vec::new()));
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_capture(StdArc::new(
+                RecordingClientHelloCapture {
+                    bytes: captured.clone(),
+                },
+            )))),
+        }));
+
+        let emitted = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        assert_eq!(*captured.lock().unwrap(), emitted);
+    }
+
+    #[test]
+    fn client_hello_customizer_session_id_rejects_long_values() {
+        let too_long = vec![0xaau8; 33];
+
+        assert!(ClientHelloSessionId::try_from(too_long).is_err());
     }
 
     #[test]
@@ -678,6 +750,51 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
         .unwrap();
     assert_eq!(key_shares.len(), 1);
     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
+}
+
+#[derive(Debug)]
+struct StaticClientHelloCustomizer {
+    plan: Mutex<Option<ClientHelloPlan>>,
+}
+
+impl ClientHelloCustomizer for StaticClientHelloCustomizer {
+    fn build_client_hello_plan(
+        &self,
+        _context: ClientHelloContext<'_>,
+    ) -> Result<Option<ClientHelloPlan>, Error> {
+        Ok(self.plan.lock().unwrap().take())
+    }
+}
+
+#[derive(Debug)]
+struct RecordingClientHelloCapture {
+    bytes: StdArc<Mutex<Vec<u8>>>,
+}
+
+impl crate::client::CapturesClientHello for RecordingClientHelloCapture {
+    fn capture_client_hello(&self, bytes: &[u8]) -> Result<(), Error> {
+        *self.bytes.lock().unwrap() = bytes.to_vec();
+        Ok(())
+    }
+}
+
+fn client_hello_encoded_bytes_for_config(config: ClientConfig) -> Result<Vec<u8>, Error> {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+
+    let message = OutboundOpaqueMessage::read(&mut Reader::init(&bytes))
+        .unwrap()
+        .into_plain_message();
+
+    match Message::try_from(message).unwrap() {
+        Message {
+            payload: MessagePayload::Handshake { encoded, .. },
+            ..
+        } => Ok(encoded.into_vec()),
+        other => panic!("unexpected message {other:?}"),
+    }
 }
 
 fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {
