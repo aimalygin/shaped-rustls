@@ -611,7 +611,7 @@ pub mod client {
         ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension, ClientHelloRawExtensions,
         ClientHelloRawKeyShare, ClientHelloRawKeyShares, ClientHelloSessionId,
         ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups, ClientHelloSupportedVersions,
-        FixedX25519KeyShare, ObservesX25519KeyShare,
+        FinalizesClientHello, FixedX25519KeyShare, ObservesX25519KeyShare,
     };
     pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
     pub use handy::AlwaysResolvesClientRawPublicKeys;

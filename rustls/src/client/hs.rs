@@ -18,7 +18,10 @@ use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-use crate::client::{ClientConfig, ClientHelloContext, ClientHelloPlan, EchMode, EchStatus, tls13};
+use crate::client::{
+    ClientConfig, ClientHelloContext, ClientHelloPlan, EchMode, EchStatus, FinalizesClientHello,
+    tls13,
+};
 use crate::common_state::{CommonState, HandshakeKind, Protocol, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::KeyExchangeAlgorithm;
@@ -30,7 +33,7 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::{Payload, PayloadU8};
-use crate::msgs::codec::Codec;
+use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -1058,6 +1061,17 @@ fn emit_client_hello_for_retry(
 
     // Do we have a SessionID or ticket cached for this host?
     let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
+    let has_tls13_session = tls13_session.is_some();
+    let client_hello_finalizer = input
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.finalizer.as_ref())
+        .cloned();
+    if client_hello_finalizer.is_some() && has_tls13_session {
+        return Err(Error::General(
+            "ClientHello finalizer is not supported with TLS 1.3 PSK resumption".into(),
+        ));
+    }
 
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
@@ -1257,6 +1271,14 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
+    let ch = match client_hello_finalizer.as_deref() {
+        Some(finalizer) => {
+            let (ch, session_id) = finalize_client_hello(ch, finalizer)?;
+            input.session_id = session_id;
+            ch
+        }
+        None => ch,
+    };
 
     if let Some(capture) = input
         .plan
@@ -1326,6 +1348,114 @@ fn emit_client_hello_for_retry(
     } else {
         Box::new(next)
     })
+}
+
+fn finalize_client_hello(
+    ch: Message<'static>,
+    finalizer: &dyn FinalizesClientHello,
+) -> Result<(Message<'static>, SessionId), Error> {
+    let Message { version, payload } = ch;
+    let MessagePayload::Handshake { encoded, .. } = payload else {
+        return Err(Error::General(
+            "ClientHello finalizer can only run on handshake messages".into(),
+        ));
+    };
+
+    let original = encoded.into_vec();
+    let session_id_range = client_hello_session_id_range(&original)?;
+    let mut finalized = original.clone();
+    finalizer.finalize_client_hello(&mut finalized)?;
+    let session_id = SessionId::from_bytes(&finalized[session_id_range.clone()])
+        .map_err(|_| Error::General("finalized ClientHello session id is invalid".into()))?;
+    let parsed = validate_finalized_client_hello(&original, &finalized, session_id_range)?;
+
+    Ok((
+        Message {
+            version,
+            payload: MessagePayload::Handshake {
+                parsed,
+                encoded: Payload::new(finalized),
+            },
+        },
+        session_id,
+    ))
+}
+
+fn validate_finalized_client_hello(
+    original: &[u8],
+    finalized: &[u8],
+    session_id_range: core::ops::Range<usize>,
+) -> Result<HandshakeMessagePayload<'static>, Error> {
+    if finalized.len() != original.len() {
+        return Err(Error::General(
+            "ClientHello finalizer must preserve ClientHello length".into(),
+        ));
+    }
+
+    if original[..session_id_range.start] != finalized[..session_id_range.start]
+        || original[session_id_range.end..] != finalized[session_id_range.end..]
+    {
+        return Err(Error::General(
+            "ClientHello finalizer may only change legacy session id bytes".into(),
+        ));
+    }
+
+    let mut reader = Reader::init(finalized);
+    let parsed = HandshakeMessagePayload::read(&mut reader)?.into_owned();
+    reader.expect_empty("finalized ClientHello")?;
+    if !matches!(parsed.0, HandshakePayload::ClientHello(_)) {
+        return Err(Error::General(
+            "ClientHello finalizer must return a ClientHello handshake message".into(),
+        ));
+    }
+
+    Ok(parsed)
+}
+
+fn client_hello_session_id_range(encoded: &[u8]) -> Result<core::ops::Range<usize>, Error> {
+    const HEADER_LEN: usize = 4;
+    const LEGACY_VERSION_LEN: usize = 2;
+    const RANDOM_LEN: usize = 32;
+    let session_id_len_offset = HEADER_LEN + LEGACY_VERSION_LEN + RANDOM_LEN;
+
+    if encoded.len() <= session_id_len_offset {
+        return Err(Error::General(
+            "encoded ClientHello is too short for legacy session id".into(),
+        ));
+    }
+
+    if encoded[0] != u8::from(HandshakeType::ClientHello) {
+        return Err(Error::General(
+            "ClientHello finalizer must receive a ClientHello handshake message".into(),
+        ));
+    }
+
+    let encoded_len =
+        (usize::from(encoded[1]) << 16) | (usize::from(encoded[2]) << 8) | usize::from(encoded[3]);
+    if encoded_len + HEADER_LEN != encoded.len() {
+        return Err(Error::General(
+            "encoded ClientHello length header is inconsistent".into(),
+        ));
+    }
+
+    let session_id_len = usize::from(encoded[session_id_len_offset]);
+    if session_id_len > 32 {
+        return Err(Error::General(
+            "encoded ClientHello legacy session id is too long".into(),
+        ));
+    }
+
+    let start = session_id_len_offset + 1;
+    let end = start
+        .checked_add(session_id_len)
+        .ok_or_else(|| Error::General("encoded ClientHello session id is too large".into()))?;
+    if end > encoded.len() {
+        return Err(Error::General(
+            "encoded ClientHello legacy session id is truncated".into(),
+        ));
+    }
+
+    Ok(start..end)
 }
 
 /// Prepares `exts` and `cx` with TLS 1.2 or TLS 1.3 session

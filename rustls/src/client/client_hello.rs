@@ -112,6 +112,20 @@ pub trait CapturesClientHello: fmt::Debug + Send + Sync {
     fn capture_client_hello(&self, bytes: &[u8]) -> Result<(), Error>;
 }
 
+/// Applies a final length-preserving edit to an encoded ClientHello.
+///
+/// The input bytes are the encoded TLS handshake message, including its
+/// handshake header and excluding any record-layer header. The first
+/// implementation only permits changing the legacy session id bytes; all other
+/// ClientHello bytes must remain unchanged. This mirrors the uTLS/Xray REALITY
+/// flow without exposing rustls key exchange internals or allowing arbitrary
+/// ClientHello rewrites.
+pub trait FinalizesClientHello: fmt::Debug + Send + Sync {
+    /// Finalize the encoded ClientHello before it is captured, added to the
+    /// transcript, or written to the peer.
+    fn finalize_client_hello(&self, bytes: &mut Vec<u8>) -> Result<(), Error>;
+}
+
 /// Receives the X25519 key share material used in the ClientHello.
 pub trait ObservesX25519KeyShare: fmt::Debug + Send + Sync {
     /// Observes the encoded X25519 public key.
@@ -1160,6 +1174,7 @@ pub struct ClientHelloPlan {
     pub(crate) random: Option<[u8; 32]>,
     pub(crate) session_id: Option<ClientHelloSessionId>,
     pub(crate) capture: Option<Arc<dyn CapturesClientHello>>,
+    pub(crate) finalizer: Option<Arc<dyn FinalizesClientHello>>,
     pub(crate) fixed_x25519: Option<FixedX25519KeyShare>,
     pub(crate) extension_order: Option<ClientHelloExtensionOrder>,
     pub(crate) extensions: Option<ClientHelloExtensionPlan>,
@@ -1206,6 +1221,15 @@ impl ClientHelloPlan {
     /// Capture the final encoded ClientHello.
     pub fn with_capture(mut self, capture: Arc<dyn CapturesClientHello>) -> Self {
         self.capture = Some(capture);
+        self
+    }
+
+    /// Finalize the encoded ClientHello before capture, transcript, and write.
+    ///
+    /// This is intended for REALITY-style session id sealing. It is not
+    /// supported with active TLS 1.3 PSK binders/resumption.
+    pub fn with_finalizer(mut self, finalizer: Arc<dyn FinalizesClientHello>) -> Self {
+        self.finalizer = Some(finalizer);
         self
     }
 

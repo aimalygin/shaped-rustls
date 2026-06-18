@@ -17,7 +17,7 @@ use crate::client::{
     ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension,
     ClientHelloRawExtensions, ClientHelloRawKeyShare, ClientHelloRawKeyShares,
     ClientHelloSessionId, ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups,
-    ClientHelloSupportedVersions, Resumption, Tls12Resumption,
+    ClientHelloSupportedVersions, FinalizesClientHello, Resumption, Tls12Resumption,
 };
 use crate::crypto::CryptoProvider;
 use crate::enums::{
@@ -172,6 +172,169 @@ mod tests {
         let emitted = client_hello_encoded_bytes_for_config(config).unwrap();
 
         assert_eq!(*captured.lock().unwrap(), emitted);
+    }
+
+    #[test]
+    fn client_hello_finalizer_patches_captured_and_emitted_session_id() {
+        let captured = StdArc::new(Mutex::new(Vec::new()));
+        let finalizer_called = StdArc::new(AtomicBool::new(false));
+        let replacement_session_id = [0x5au8; 32];
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_session_id(ClientHelloSessionId::try_from(vec![0; 32]).unwrap())
+                    .with_finalizer(StdArc::new(PatchingClientHelloFinalizer {
+                        replacement_session_id,
+                        called: finalizer_called.clone(),
+                    }))
+                    .with_capture(StdArc::new(RecordingClientHelloCapture {
+                        bytes: captured.clone(),
+                    })),
+            )),
+        }));
+
+        let emitted = client_hello_encoded_bytes_for_config(config).unwrap();
+        let ch = client_hello_from_encoded(&emitted);
+
+        assert!(finalizer_called.load(Ordering::SeqCst));
+        assert_eq!(ch.session_id.as_ref(), replacement_session_id);
+        assert_eq!(*captured.lock().unwrap(), emitted);
+    }
+
+    #[test]
+    fn client_hello_finalizer_error_fails_before_emitting_client_hello() {
+        let finalizer_called = StdArc::new(AtomicBool::new(false));
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_session_id(ClientHelloSessionId::try_from(vec![0; 32]).unwrap())
+                    .with_finalizer(StdArc::new(FailingClientHelloFinalizer {
+                        called: finalizer_called.clone(),
+                    })),
+            )),
+        }));
+
+        let err = ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+            .unwrap_err();
+
+        assert!(finalizer_called.load(Ordering::SeqCst));
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("test finalizer failure"));
+    }
+
+    #[test]
+    fn client_hello_finalizer_rejects_non_session_id_changes() {
+        let finalizer_called = StdArc::new(AtomicBool::new(false));
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_session_id(ClientHelloSessionId::try_from(vec![0; 32]).unwrap())
+                    .with_finalizer(StdArc::new(MutatingClientHelloFinalizer {
+                        mutation: ClientHelloFinalizerMutation::NonSessionByte,
+                        called: finalizer_called.clone(),
+                    })),
+            )),
+        }));
+
+        let err = ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+            .unwrap_err();
+
+        assert!(finalizer_called.load(Ordering::SeqCst));
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("may only change legacy session id bytes"));
+    }
+
+    #[test]
+    fn client_hello_finalizer_rejects_length_changes() {
+        let finalizer_called = StdArc::new(AtomicBool::new(false));
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_protocol_versions(&[&version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_session_id(ClientHelloSessionId::try_from(vec![0; 32]).unwrap())
+                    .with_finalizer(StdArc::new(MutatingClientHelloFinalizer {
+                        mutation: ClientHelloFinalizerMutation::Length,
+                        called: finalizer_called.clone(),
+                    })),
+            )),
+        }));
+
+        let err = ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+            .unwrap_err();
+
+        assert!(finalizer_called.load(Ordering::SeqCst));
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("must preserve ClientHello length"));
+    }
+
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn client_hello_finalizer_session_id_completes_tls13_handshake() {
+        let finalizer_called = StdArc::new(AtomicBool::new(false));
+        let replacement_session_id = [0x5au8; 32];
+        let provider = super::provider::default_provider();
+        let mut client_config = ClientConfig::builder_with_provider(provider.clone().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        client_config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_session_id(ClientHelloSessionId::try_from(vec![0; 32]).unwrap())
+                    .with_finalizer(StdArc::new(PatchingClientHelloFinalizer {
+                        replacement_session_id,
+                        called: finalizer_called.clone(),
+                    })),
+            )),
+        }));
+        let server_config = ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(server_cert(), server_key())
+            .unwrap();
+        let mut client = ClientConnection::new(
+            client_config.into(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(server_config.into()).unwrap();
+
+        do_handshake(&mut client, &mut server);
+
+        assert!(finalizer_called.load(Ordering::SeqCst));
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
     }
 
     #[test]
@@ -2848,6 +3011,60 @@ struct RecordingClientHelloCapture {
 impl crate::client::CapturesClientHello for RecordingClientHelloCapture {
     fn capture_client_hello(&self, bytes: &[u8]) -> Result<(), Error> {
         *self.bytes.lock().unwrap() = bytes.to_vec();
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PatchingClientHelloFinalizer {
+    replacement_session_id: [u8; 32],
+    called: StdArc<AtomicBool>,
+}
+
+impl FinalizesClientHello for PatchingClientHelloFinalizer {
+    fn finalize_client_hello(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+        self.called
+            .store(true, Ordering::SeqCst);
+        assert_eq!(bytes[38], 32);
+        assert_eq!(&bytes[39..71], &[0; 32]);
+        bytes[39..71].copy_from_slice(&self.replacement_session_id);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingClientHelloFinalizer {
+    called: StdArc<AtomicBool>,
+}
+
+impl FinalizesClientHello for FailingClientHelloFinalizer {
+    fn finalize_client_hello(&self, _bytes: &mut Vec<u8>) -> Result<(), Error> {
+        self.called
+            .store(true, Ordering::SeqCst);
+        Err(Error::General("test finalizer failure".into()))
+    }
+}
+
+#[derive(Debug)]
+struct MutatingClientHelloFinalizer {
+    mutation: ClientHelloFinalizerMutation,
+    called: StdArc<AtomicBool>,
+}
+
+#[derive(Debug)]
+enum ClientHelloFinalizerMutation {
+    NonSessionByte,
+    Length,
+}
+
+impl FinalizesClientHello for MutatingClientHelloFinalizer {
+    fn finalize_client_hello(&self, bytes: &mut Vec<u8>) -> Result<(), Error> {
+        self.called
+            .store(true, Ordering::SeqCst);
+        match self.mutation {
+            ClientHelloFinalizerMutation::NonSessionByte => bytes[10] ^= 0xff,
+            ClientHelloFinalizerMutation::Length => bytes.push(0),
+        }
         Ok(())
     }
 }
