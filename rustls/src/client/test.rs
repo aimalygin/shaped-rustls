@@ -17,7 +17,7 @@ use crate::client::{
     ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension,
     ClientHelloRawExtensions, ClientHelloRawKeyShare, ClientHelloRawKeyShares,
     ClientHelloSessionId, ClientHelloSignatureAlgorithms, ClientHelloSupportedGroups,
-    ClientHelloSupportedVersions, FinalizesClientHello, Resumption, Tls12Resumption,
+    ClientHelloSupportedVersions, EchStatus, FinalizesClientHello, Resumption, Tls12Resumption,
 };
 use crate::crypto::CryptoProvider;
 use crate::enums::{
@@ -1309,6 +1309,35 @@ mod tests {
             client_hello_extension_types_from_encoded(&encoded)
                 .contains(&u16::from(ExtensionType::EncryptedClientHello))
         );
+    }
+
+    #[test]
+    fn client_hello_plan_exact_ech_marks_grease_ech_status() {
+        let exact_ech = ClientHelloExactExtension::new(
+            u16::from(ExtensionType::EncryptedClientHello),
+            vec![0, 0, 1, 0, 1, 0, 0, 0, 1, 0],
+        )
+        .unwrap();
+        let exact_extensions = ClientHelloExactExtensions::try_from(vec![exact_ech]).unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_exact_extensions(exact_extensions),
+            )),
+        }));
+        let mut client =
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+
+        client
+            .write_tls(&mut Vec::new())
+            .unwrap();
+
+        assert_eq!(client.ech_status(), EchStatus::Grease);
     }
 
     #[test]

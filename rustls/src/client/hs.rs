@@ -1196,6 +1196,9 @@ fn emit_client_hello_for_retry(
             "ClientHello exact encrypted_client_hello conflicts with managed ECH".into(),
         ));
     }
+    if has_exact_ech && ech_state.is_none() && cx.data.ech_status == EchStatus::NotOffered {
+        cx.data.ech_status = EchStatus::Grease;
+    }
 
     match (cx.data.ech_status, &mut ech_state) {
         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
