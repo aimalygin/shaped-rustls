@@ -2236,6 +2236,70 @@ mod tests {
 
     #[cfg(feature = "aws_lc_rs")]
     #[test]
+    fn client_hello_customizer_can_set_fixed_x25519_inside_draft_kyber_key_share() {
+        let private_key =
+            hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected_public =
+            hex::decode("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+                .unwrap();
+        let observed_public = StdArc::new(Mutex::new(None));
+        let draft_group = NamedGroup::Unknown(0x6399);
+        let key_shares = ClientHelloKeySharePlan::try_from(vec![draft_group]).unwrap();
+        let provider = CryptoProvider {
+            kx_groups: vec![crate::crypto::aws_lc_rs::kx_group::X25519KYBER768DRAFT00],
+            ..crate::crypto::aws_lc_rs::default_provider()
+        };
+        let mut config = ClientConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_key_share_plan(key_shares)
+                    .with_fixed_x25519(
+                        crate::client::FixedX25519KeyShare::new(private_key).with_observer(
+                            StdArc::new(RecordingX25519KeyShare {
+                                public_key: observed_public.clone(),
+                            }),
+                        ),
+                    ),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        let key_share = ch
+            .extensions
+            .key_shares
+            .as_ref()
+            .unwrap()
+            .first()
+            .unwrap();
+        assert_eq!(key_share.group, draft_group);
+        assert_eq!(&key_share.payload.0[..32], expected_public.as_slice());
+        assert_eq!(key_share.payload.0.len(), 1216);
+        assert!(
+            key_share.payload.0[32..]
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert_eq!(
+            observed_public
+                .lock()
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            expected_public.as_slice()
+        );
+    }
+
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
     fn fixed_x25519_key_share_completes_tls13_handshake() {
         let private_key =
             hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
@@ -2260,6 +2324,69 @@ mod tests {
                     },
                 )),
             ))),
+        }));
+        let server_config = ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(server_cert(), server_key())
+            .unwrap();
+        let mut client = ClientConnection::new(
+            client_config.into(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(server_config.into()).unwrap();
+
+        do_handshake(&mut client, &mut server);
+
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        assert_eq!(
+            observed_public
+                .lock()
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            expected_public.as_slice()
+        );
+    }
+
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn fixed_x25519_draft_kyber_key_share_completes_tls13_handshake() {
+        let private_key =
+            hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected_public =
+            hex::decode("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+                .unwrap();
+        let observed_public = StdArc::new(Mutex::new(None));
+        let draft_group = NamedGroup::Unknown(0x6399);
+        let key_shares = ClientHelloKeySharePlan::try_from(vec![draft_group]).unwrap();
+        let provider = CryptoProvider {
+            kx_groups: vec![crate::crypto::aws_lc_rs::kx_group::X25519KYBER768DRAFT00],
+            ..crate::crypto::aws_lc_rs::default_provider()
+        };
+        let mut client_config = ClientConfig::builder_with_provider(provider.clone().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        client_config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_key_share_plan(key_shares)
+                    .with_fixed_x25519(
+                        crate::client::FixedX25519KeyShare::new(private_key).with_observer(
+                            StdArc::new(RecordingX25519KeyShare {
+                                public_key: observed_public.clone(),
+                            }),
+                        ),
+                    ),
+            )),
         }));
         let server_config = ServerConfig::builder_with_provider(provider.into())
             .with_protocol_versions(&[&version::TLS13])

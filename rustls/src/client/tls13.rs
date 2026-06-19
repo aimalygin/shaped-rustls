@@ -525,10 +525,10 @@ fn start_fixed_x25519_key_share(
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
     if !matches!(
         group.name(),
-        NamedGroup::X25519 | NamedGroup::X25519MLKEM768
+        NamedGroup::X25519 | NamedGroup::X25519MLKEM768 | NamedGroup::Unknown(0x6399)
     ) {
         return Err(Error::General(
-            "fixed X25519 key share requires X25519 or X25519MLKEM768 to be the selected group"
+            "fixed X25519 key share requires X25519, X25519MLKEM768, or X25519Kyber768Draft00 to be the selected group"
                 .into(),
         ));
     }
@@ -549,9 +549,23 @@ fn start_fixed_x25519_key_share(
                     }
                 }
                 return Ok(key_exchange);
+            } else if core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519KYBER768DRAFT00) {
+                let key_exchange =
+                    crypto::aws_lc_rs::pq::start_x25519kyber768draft00_with_fixed_x25519(
+                        fixed_x25519.private_key(),
+                    )?;
+                if let Some((NamedGroup::X25519, public_key)) = key_exchange.hybrid_component() {
+                    let public_key: &[u8; 32] = public_key.try_into().map_err(|_| {
+                        Error::General("fixed X25519 public key was not 32 bytes".into())
+                    })?;
+                    if let Some(observer) = fixed_x25519.observer() {
+                        observer.observe_x25519_key_share(public_key)?;
+                    }
+                }
+                return Ok(key_exchange);
             } else {
                 return Err(Error::General(
-                    "fixed X25519 key share requires aws-lc X25519 or X25519MLKEM768 to be the selected group".into(),
+                    "fixed X25519 key share requires aws-lc X25519, X25519MLKEM768, or X25519Kyber768Draft00 to be the selected group".into(),
                 ));
             }
         }

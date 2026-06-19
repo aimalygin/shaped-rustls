@@ -526,14 +526,6 @@ impl TryFrom<Vec<NamedGroup>> for ClientHelloSupportedGroups {
 
     fn try_from(value: Vec<NamedGroup>) -> Result<Self, Self::Error> {
         reject_empty_and_duplicate_keys(&value, u16::from, "supported groups")?;
-        if value
-            .iter()
-            .any(|group| matches!(group, NamedGroup::Unknown(_)))
-        {
-            return Err(Error::General(
-                "ClientHello supported groups cannot contain unknown values".into(),
-            ));
-        }
 
         Ok(Self(value))
     }
@@ -555,14 +547,6 @@ impl TryFrom<Vec<NamedGroup>> for ClientHelloKeySharePlan {
 
     fn try_from(value: Vec<NamedGroup>) -> Result<Self, Self::Error> {
         reject_empty_and_duplicate_keys(&value, u16::from, "key share groups")?;
-        if value
-            .iter()
-            .any(|group| matches!(group, NamedGroup::Unknown(_)))
-        {
-            return Err(Error::General(
-                "ClientHello key share groups cannot contain unknown values".into(),
-            ));
-        }
 
         Ok(Self(value))
     }

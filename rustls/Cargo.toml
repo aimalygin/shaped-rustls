@@ -18,7 +18,7 @@ build = "build.rs"
 default = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]
 
 aws-lc-rs = ["aws_lc_rs"] # Alias because Cargo features commonly use `-`
-aws_lc_rs = ["dep:aws-lc-rs", "webpki/aws-lc-rs", "aws-lc-rs/aws-lc-sys", "aws-lc-rs/prebuilt-nasm"]
+aws_lc_rs = ["dep:aws-lc-rs", "dep:shake", "webpki/aws-lc-rs", "aws-lc-rs/aws-lc-sys", "aws-lc-rs/prebuilt-nasm"]
 brotli = ["dep:brotli", "dep:brotli-decompressor", "std"]
 custom-provider = []
 fips = ["aws_lc_rs", "aws-lc-rs?/fips", "webpki/aws-lc-rs-fips"]
@@ -45,6 +45,7 @@ ring = { workspace = true, optional = true }
 subtle = { workspace = true }
 webpki = { workspace = true }
 pki-types = { workspace = true }
+shake = { workspace = true, optional = true }
 zeroize = { workspace = true }
 zlib-rs = { workspace = true, optional = true }
 
