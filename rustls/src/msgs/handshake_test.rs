@@ -155,6 +155,14 @@ fn refuses_certificate_ext_with_unknown_type() {
 }
 
 #[test]
+fn ignores_unknown_certificate_ext() {
+    let bytes = [0x00u8, 0x07, 0x12, 0x34, 0x00, 0x03, 0x01, 0x02, 0x03];
+    let extensions = CertificateExtensions::read_bytes(&bytes).unwrap();
+
+    assert!(extensions.status.is_none());
+}
+
+#[test]
 fn refuses_certificate_req_ext_with_unparsed_bytes() {
     let bytes = [
         0x00u8, 0x09, 0x00, 0x0d, 0x00, 0x05, 0x00, 0x02, 0x01, 0x02, 0xff,

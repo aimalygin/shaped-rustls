@@ -1947,9 +1947,7 @@ impl<'a> Codec<'a> for CertificateExtensions<'a> {
         let mut sub = r.sub(len)?;
 
         while sub.any_left() {
-            out.read_one(&mut sub, |_unk| {
-                Err(InvalidMessage::UnknownCertificateExtension)
-            })?;
+            out.read_one(&mut sub, |_unk| Ok(()))?;
         }
 
         Ok(out)
