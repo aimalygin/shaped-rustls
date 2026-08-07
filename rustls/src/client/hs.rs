@@ -787,27 +787,61 @@ fn insert_at<T>(items: &mut Vec<T>, position: usize, value: T, what: &str) -> Re
     Ok(())
 }
 
-fn non_final_extension_count(exts: &ClientExtensions<'_>) -> usize {
-    let mut order = exts.collect_used_with_raw();
-    order.retain(|ext| {
-        !(matches!(ext, ExtensionType::PreSharedKey)
-            || matches!(ext, ExtensionType::EncryptedClientHello)
-                && exts.encrypted_client_hello.is_some()
-                && !exts.has_exact_extension(ExtensionType::EncryptedClientHello)
-            || matches!(ext, ExtensionType::EncryptedClientHelloOuterExtensions)
-                && exts
-                    .encrypted_client_hello_outer
-                    .is_some()
-                && !exts.has_exact_extension(ExtensionType::EncryptedClientHelloOuterExtensions)
-            || exts.contiguous_extensions.contains(ext))
-    });
-    order.len()
+/// A planned extension order reconciled with the extensions rustls emitted.
+///
+/// A plan is written before the connection exists, so it can name an extension
+/// this particular ClientHello turns out not to carry. The one that happens in
+/// practice is `server_name`: RFC 6066 forbids SNI for an IP address, so
+/// rustls omits the extension whenever the server name is an IP literal, and a
+/// plan built from a browser fingerprint still lists it.
+///
+/// Rejecting the plan would be wrong -- uTLS, the reference these plans
+/// describe, keeps a zero-length `SNIExtension` in its extension list and
+/// writes nothing for it, so the extension is simply absent and everything
+/// after it shifts up one place. This type reproduces that: the unemitted
+/// entries drop out of the order, and a GREASE extension planned against the
+/// order keeps the neighbours it was planned with.
+struct PlannedExtensionOrder {
+    /// The planned order with the unemitted entries removed. Every extension
+    /// rustls did emit is still here, exactly as often as it was planned, so
+    /// [`ClientExtensions::set_custom_order`] still rejects an order that
+    /// leaves an emitted extension unplaced.
+    emitted: Vec<ExtensionType>,
+    /// Where each planned position lands once the unemitted entries are gone,
+    /// indexed by planned position. One entry longer than the planned order,
+    /// because a GREASE extension may be planned just past its last entry.
+    positions: Vec<usize>,
+}
+
+impl PlannedExtensionOrder {
+    fn new(planned: Vec<ExtensionType>, exts: &ClientExtensions<'_>) -> Self {
+        let orderable = exts.orderable_extension_types();
+        let mut emitted = Vec::with_capacity(planned.len());
+        let mut positions = Vec::with_capacity(planned.len() + 1);
+
+        for extension_type in planned {
+            positions.push(emitted.len());
+            if orderable.contains(&extension_type) {
+                emitted.push(extension_type);
+            }
+        }
+        positions.push(emitted.len());
+
+        Self { emitted, positions }
+    }
+
+    /// Translates a GREASE extension position from the planned order into the
+    /// emitted one, or `None` if the plan put it past the end of its own order.
+    fn grease_position(&self, planned: usize) -> Option<usize> {
+        self.positions.get(planned).copied()
+    }
 }
 
 fn apply_grease_plan(
     plan: Option<&ClientHelloPlan>,
     exts: &mut ClientExtensions<'_>,
     cipher_suites: &mut Vec<CipherSuite>,
+    extension_order: Option<&PlannedExtensionOrder>,
 ) -> Result<(), Error> {
     let Some(grease) = plan.and_then(|plan| plan.grease.as_ref()) else {
         return Ok(());
@@ -867,12 +901,22 @@ fn apply_grease_plan(
     }
 
     for extension in grease.extensions() {
-        let position = extension.position();
-        if position > non_final_extension_count(exts) {
+        // With a planned order, GREASE positions are indices into that order,
+        // so they have to be translated to the order actually emitted. Without
+        // one, the surrounding extensions are in a randomized order and the
+        // position can only be read against the emitted extensions directly.
+        let position = match extension_order {
+            Some(order) => order.grease_position(extension.position()),
+            None => {
+                let position = extension.position();
+                (position <= exts.orderable_extension_types().len()).then_some(position)
+            }
+        };
+        let Some(position) = position else {
             return Err(Error::General(
                 "ClientHello GREASE position is out of range for extensions".into(),
             ));
-        }
+        };
         exts.grease_extensions.push((
             position,
             ExtensionType::from(extension.value()),
@@ -1142,7 +1186,29 @@ fn emit_client_hello_for_retry(
     apply_exact_extension_plan(input.plan.as_ref(), &mut exts)?;
     apply_raw_key_share_plan(input.plan.as_ref(), &mut exts)?;
     apply_padding_plan(input.plan.as_ref(), &mut exts)?;
-    apply_grease_plan(input.plan.as_ref(), &mut exts, &mut cipher_suites)?;
+    // Every extension this ClientHello carries is decided by now, so the
+    // planned order can be reconciled with it -- which both the GREASE
+    // positions and the order itself are read against.
+    let extension_order = input
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.extension_order.as_ref())
+        .map(|order| {
+            PlannedExtensionOrder::new(
+                order
+                    .as_slice()
+                    .iter()
+                    .map(|extension| ExtensionType::from(extension.0))
+                    .collect(),
+                &exts,
+            )
+        });
+    apply_grease_plan(
+        input.plan.as_ref(),
+        &mut exts,
+        &mut cipher_suites,
+        extension_order.as_ref(),
+    )?;
 
     let mut chp_payload = ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_2,
@@ -1153,19 +1219,10 @@ fn emit_client_hello_for_retry(
         extensions: exts,
     };
 
-    if let Some(order) = input
-        .plan
-        .as_ref()
-        .and_then(|plan| plan.extension_order.as_ref())
-    {
-        let order = order
-            .as_slice()
-            .iter()
-            .map(|extension| ExtensionType::from(extension.0))
-            .collect();
+    if let Some(order) = extension_order {
         chp_payload
             .extensions
-            .set_custom_order(order)?;
+            .set_custom_order(order.emitted)?;
     }
 
     let ech_grease_config = input

@@ -1170,11 +1170,22 @@ impl ClientExtensions<'_> {
         }
     }
 
-    pub(crate) fn set_custom_order(&mut self, order: Vec<ExtensionType>) -> Result<(), Error> {
-        let mut required = self.collect_used_with_raw();
-        required.retain(|ext| {
+    /// The extensions whose position in the ClientHello a custom order decides.
+    ///
+    /// This is every extension actually emitted, less the ones whose position
+    /// is fixed by the protocol: the final extensions (PSK, and ECH when
+    /// rustls itself is constructing it) and the ones named in
+    /// `contiguous_extensions`.
+    pub(crate) fn orderable_extension_types(&self) -> Vec<ExtensionType> {
+        let mut orderable = self.collect_used_with_raw();
+        orderable.retain(|ext| {
             !self.is_final_extension(*ext) && !self.contiguous_extensions.contains(ext)
         });
+        orderable
+    }
+
+    pub(crate) fn set_custom_order(&mut self, order: Vec<ExtensionType>) -> Result<(), Error> {
+        let mut required = self.orderable_extension_types();
         required.sort_by_key(|ext| u16::from(*ext));
 
         let mut provided = order.clone();

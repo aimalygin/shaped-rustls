@@ -1750,6 +1750,225 @@ mod tests {
         assert!(message.contains("GREASE position"));
     }
 
+    /// A plan is written before the connection exists, so it can name an
+    /// extension this hello turns out not to carry. `server_name` is the case
+    /// that happens: RFC 6066 forbids SNI for an IP address, so rustls omits
+    /// the extension for an IP-literal server name while a plan built from a
+    /// browser fingerprint still lists it. uTLS keeps a zero-length
+    /// `SNIExtension` in its list and writes nothing for it, so the extension
+    /// is absent and everything after it shifts up one place; matching that is
+    /// what lets a shaped hello reach an IP-addressed server at all.
+    #[test]
+    fn client_hello_customizer_elides_a_planned_extension_the_hello_omits() {
+        let encoded = ip_literal_client_hello(planned_order_with_grease()).unwrap();
+
+        assert_eq!(
+            client_hello_extension_types_from_encoded(&encoded),
+            vec![
+                0x0a0a,
+                u16::from(ExtensionType::SupportedVersions),
+                u16::from(ExtensionType::SignatureAlgorithms),
+                u16::from(ExtensionType::EllipticCurves),
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::KeyShare),
+                0x1a1a,
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+                0x2a2a,
+            ]
+        );
+    }
+
+    /// The same plan with a name rustls does send SNI for. Read against the
+    /// elided case above, this pins down what "shifts up one place" means: the
+    /// GREASE ahead of `server_name` keeps its position, and the two behind it
+    /// keep the neighbours they were planned with rather than the indices.
+    #[test]
+    fn client_hello_customizer_keeps_the_planned_order_when_nothing_is_elided() {
+        let mut config = tls13_x25519_client_config();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(planned_order_with_grease())),
+        }));
+
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+
+        assert_eq!(
+            client_hello_extension_types_from_encoded(&encoded),
+            vec![
+                0x0a0a,
+                u16::from(ExtensionType::SupportedVersions),
+                u16::from(ExtensionType::ServerName),
+                u16::from(ExtensionType::SignatureAlgorithms),
+                u16::from(ExtensionType::EllipticCurves),
+                u16::from(ExtensionType::ECPointFormats),
+                u16::from(ExtensionType::ExtendedMasterSecret),
+                u16::from(ExtensionType::StatusRequest),
+                u16::from(ExtensionType::KeyShare),
+                0x1a1a,
+                u16::from(ExtensionType::PSKKeyExchangeModes),
+                0x2a2a,
+            ]
+        );
+    }
+
+    /// Eliding is one-directional. An order that leaves out an extension the
+    /// hello does carry would let rustls randomize that extension's position,
+    /// which is itself a fingerprint, so it stays an error.
+    #[test]
+    fn client_hello_customizer_still_requires_every_emitted_extension_in_the_order() {
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+        ])
+        .unwrap();
+        let mut config = tls13_x25519_client_config();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_extension_order(order))),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("extension order must contain every non-final emitted extension"));
+    }
+
+    /// With an order to read them against, GREASE positions are indices into
+    /// that order, so the range they have to fall in is the order's -- not the
+    /// emitted list's, which eliding makes shorter.
+    #[test]
+    fn client_hello_customizer_rejects_a_grease_position_past_the_planned_order() {
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 10, vec![]).unwrap())
+            .unwrap();
+        let mut config = tls13_x25519_client_config();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_extension_order(order)
+                    .with_grease(grease),
+            )),
+        }));
+
+        let err = client_hello_sent_for_config(config).unwrap_err();
+
+        let Error::General(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("GREASE position"));
+    }
+
+    /// uTLS recomputes its padding from the length the hello actually reached,
+    /// so an elided `server_name` is paid for in padding and the hello stays
+    /// the size the fingerprint claims.
+    #[test]
+    fn client_hello_padding_absorbs_an_elided_extension() {
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+            u16::from(ExtensionType::Padding),
+        ])
+        .unwrap();
+        let plan = ClientHelloPlan::new()
+            .with_extension_order(order)
+            .with_padding(ClientHelloPaddingPlan::pad_to_handshake_size(512).unwrap());
+
+        let encoded = ip_literal_client_hello(plan).unwrap();
+
+        assert_eq!(encoded.len(), 512);
+        assert!(
+            !client_hello_extension_types_from_encoded(&encoded)
+                .contains(&u16::from(ExtensionType::ServerName))
+        );
+    }
+
+    /// An order naming `server_name`, with GREASE both ahead of it and behind
+    /// it -- the shape every browser fingerprint that greases has.
+    fn planned_order_with_grease() -> ClientHelloPlan {
+        let order = ClientHelloExtensionOrder::try_from(vec![
+            u16::from(ExtensionType::SupportedVersions),
+            u16::from(ExtensionType::ServerName),
+            u16::from(ExtensionType::SignatureAlgorithms),
+            u16::from(ExtensionType::EllipticCurves),
+            u16::from(ExtensionType::ECPointFormats),
+            u16::from(ExtensionType::ExtendedMasterSecret),
+            u16::from(ExtensionType::StatusRequest),
+            u16::from(ExtensionType::KeyShare),
+            u16::from(ExtensionType::PSKKeyExchangeModes),
+        ])
+        .unwrap();
+        let grease = ClientHelloGreasePlan::new(0x0a0a)
+            .unwrap()
+            // Ahead of the elided `server_name`.
+            .with_extension(ClientHelloGreaseExtension::new(0x0a0a, 0, vec![]).unwrap())
+            .unwrap()
+            // Behind it, mid-list.
+            .with_extension(ClientHelloGreaseExtension::new(0x1a1a, 8, vec![]).unwrap())
+            .unwrap()
+            // Behind it, and past the last extension, which is where eliding
+            // used to push the position out of range.
+            .with_extension(ClientHelloGreaseExtension::new(0x2a2a, 9, vec![]).unwrap())
+            .unwrap();
+
+        ClientHelloPlan::new()
+            .with_extension_order(order)
+            .with_grease(grease)
+    }
+
+    fn ip_literal_client_hello(plan: ClientHelloPlan) -> Result<Vec<u8>, Error> {
+        let mut config = tls13_x25519_client_config();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(plan)),
+        }));
+
+        client_hello_encoded_bytes_for_config_and_name(
+            config,
+            ServerName::try_from("198.51.100.7").unwrap(),
+        )
+    }
+
+    fn tls13_x25519_client_config() -> ClientConfig {
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        // Which certificate decompressors are compiled in is a feature
+        // decision, and any of them adds `compress_certificate` to the hello.
+        // These tests pin an exact extension list, so the emitted set has to
+        // be the same under every feature combination.
+        config.cert_decompressors = Vec::new();
+        config
+    }
+
     #[test]
     fn client_hello_customizer_rejects_out_of_range_supported_versions_grease_position() {
         let grease = ClientHelloGreasePlan::new(0x0a0a)
@@ -3446,8 +3665,17 @@ fn key_share_shape(body: &[u8]) -> Vec<(u16, usize)> {
 }
 
 fn client_hello_encoded_bytes_for_config(config: ClientConfig) -> Result<Vec<u8>, Error> {
-    let mut conn =
-        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    client_hello_encoded_bytes_for_config_and_name(
+        config,
+        ServerName::try_from("localhost").unwrap(),
+    )
+}
+
+fn client_hello_encoded_bytes_for_config_and_name(
+    config: ClientConfig,
+    server_name: ServerName<'static>,
+) -> Result<Vec<u8>, Error> {
+    let mut conn = ClientConnection::new(config.into(), server_name)?;
     let mut bytes = Vec::new();
     conn.write_tls(&mut bytes).unwrap();
 
