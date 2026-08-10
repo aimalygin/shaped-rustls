@@ -2423,6 +2423,55 @@ mod tests {
 
     #[cfg(feature = "aws_lc_rs")]
     #[test]
+    fn fixed_x25519_can_be_mixed_with_provider_backed_p256() {
+        let private_key =
+            hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected_public =
+            hex::decode("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+                .unwrap();
+        let key_shares =
+            ClientHelloKeySharePlan::try_from(vec![NamedGroup::X25519, NamedGroup::secp256r1])
+                .unwrap();
+        let mut config = ClientConfig::builder_with_provider(
+            crate::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_protocol_versions(&[&version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_key_share_plan(key_shares)
+                    .with_fixed_x25519(crate::client::FixedX25519KeyShare::new(private_key)),
+            )),
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+        let key_shares = ch.extensions.key_shares.unwrap();
+
+        assert_eq!(key_shares.len(), 2);
+        assert_eq!(key_shares[0].group, NamedGroup::X25519);
+        assert_eq!(
+            key_shares[0].payload.0.as_slice(),
+            expected_public.as_slice()
+        );
+        assert_eq!(key_shares[1].group, NamedGroup::secp256r1);
+        assert_eq!(key_shares[1].payload.0.len(), 65);
+        assert_eq!(key_shares[1].payload.0[0], 0x04);
+        assert!(
+            key_shares[1].payload.0[1..]
+                .iter()
+                .any(|byte| *byte != 0),
+            "P-256 must use provider-generated key material"
+        );
+    }
+
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
     fn client_hello_customizer_can_set_fixed_x25519_inside_hybrid_key_share() {
         let private_key =
             hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")

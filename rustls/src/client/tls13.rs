@@ -507,13 +507,20 @@ fn start_key_exchange_for_group(
     group: NamedGroup,
     plan: Option<&ClientHelloPlan>,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-    if let Some(fixed_x25519) = plan.and_then(|plan| plan.fixed_x25519.as_ref()) {
-        let group = config
-            .find_kx_group(group, ProtocolVersion::TLSv1_3)
-            .ok_or_else(|| {
-                Error::General("ClientHello key share group is not supported by this config".into())
-            })?;
-        return start_fixed_x25519_key_share(group, fixed_x25519);
+    if matches!(
+        group,
+        NamedGroup::X25519 | NamedGroup::X25519MLKEM768 | NamedGroup::Unknown(0x6399)
+    ) {
+        if let Some(fixed_x25519) = plan.and_then(|plan| plan.fixed_x25519.as_ref()) {
+            let supported_group = config
+                .find_kx_group(group, ProtocolVersion::TLSv1_3)
+                .ok_or_else(|| {
+                    Error::General(
+                        "ClientHello key share group is not supported by this config".into(),
+                    )
+                })?;
+            return start_fixed_x25519_key_share(supported_group, fixed_x25519);
+        }
     }
 
     start_key_exchange_for_named_group(config, group)
@@ -535,7 +542,7 @@ fn start_fixed_x25519_key_share(
 
     #[cfg(feature = "aws_lc_rs")]
     {
-        if !core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519) {
+        if group.name() != NamedGroup::X25519 {
             if core::ptr::eq(group, crypto::aws_lc_rs::kx_group::X25519MLKEM768) {
                 let key_exchange = crypto::aws_lc_rs::pq::start_x25519mlkem768_with_fixed_x25519(
                     fixed_x25519.private_key(),
