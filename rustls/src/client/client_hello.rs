@@ -1055,6 +1055,7 @@ fn is_grease_value(value: u16) -> bool {
 pub(crate) enum ClientHelloPaddingMode {
     Fixed(u16),
     PadToHandshakeSize(u16),
+    BoringSsl { offset: i16 },
 }
 
 /// Structured control for the ClientHello padding extension.
@@ -1084,9 +1085,59 @@ impl ClientHelloPaddingPlan {
         })
     }
 
+    /// Pad as BoringSSL pads, on every ClientHello of the connection.
+    ///
+    /// BoringSSL (`ssl_add_clienthello_tlsext`), and uTLS's
+    /// `BoringPaddingStyle` with it, pads a ClientHello whose handshake
+    /// message is 256 to 511 bytes long before padding: up to 512 bytes, or by
+    /// a single byte when the four-byte extension header alone would reach
+    /// 512. Any other ClientHello carries no padding extension at all. The
+    /// rule is applied to each ClientHello as it is encoded, so the second
+    /// one a HelloRetryRequest asks for is padded by its own length.
+    ///
+    /// `offset` is added to the length the rule reads and to the padding:
+    /// a ClientHello `offset` bytes shorter than the one it stands for (one
+    /// leaving out cipher suites this provider cannot negotiate, say) is
+    /// padded or left alone as that one would be, and when padded comes to
+    /// its length. A negative `offset` stands for a longer ClientHello; the
+    /// padding then shrinks by as much, down to an empty extension.
+    pub fn boringssl(offset: isize) -> Result<Self, Error> {
+        let offset = i16::try_from(offset)
+            .ok()
+            .filter(|offset| isize::from(*offset).abs() < BORINGSSL_PADDING_TARGET)
+            .ok_or_else(|| {
+                Error::General("ClientHello BoringSSL padding offset is out of range".into())
+            })?;
+        Ok(Self {
+            mode: ClientHelloPaddingMode::BoringSsl { offset },
+        })
+    }
+
     pub(crate) fn mode(&self) -> ClientHelloPaddingMode {
         self.mode
     }
+}
+
+/// The handshake message length BoringSSL pads a ClientHello up to.
+const BORINGSSL_PADDING_TARGET: isize = 0x200;
+/// The shortest handshake message BoringSSL pads.
+const BORINGSSL_PADDING_FLOOR: isize = 0x100;
+
+/// The padding body BoringSSL gives a ClientHello handshake message of
+/// `unpadded` bytes, or `None` for one it leaves without the extension
+/// (`BoringPaddingStyle` in uTLS: `paddingLen >= 4+1` keeps all but the
+/// header, otherwise one byte).
+pub(crate) fn boringssl_padding_len(unpadded: isize) -> Option<usize> {
+    const EXTENSION_HEADER_LEN: isize = 4;
+    if !(BORINGSSL_PADDING_FLOOR..BORINGSSL_PADDING_TARGET).contains(&unpadded) {
+        return None;
+    }
+    let padding = BORINGSSL_PADDING_TARGET - unpadded;
+    Some(if padding > EXTENSION_HEADER_LEN {
+        (padding - EXTENSION_HEADER_LEN) as usize
+    } else {
+        1
+    })
 }
 
 fn validate_padding_size(size: usize) -> Result<u16, Error> {

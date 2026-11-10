@@ -7,7 +7,7 @@ use core::ops::Deref;
 
 use pki_types::ServerName;
 
-use super::client_hello::ClientHelloPaddingMode;
+use super::client_hello::{ClientHelloPaddingMode, boringssl_padding_len};
 #[cfg(feature = "tls12")]
 use super::tls12;
 use super::{ResolvesClientCert, Tls12Resumption};
@@ -537,7 +537,8 @@ fn apply_padding_plan(
 
     let length = match padding.mode() {
         ClientHelloPaddingMode::Fixed(length) => length,
-        ClientHelloPaddingMode::PadToHandshakeSize(_) => 0,
+        ClientHelloPaddingMode::PadToHandshakeSize(_)
+        | ClientHelloPaddingMode::BoringSsl { .. } => 0,
     };
     exts.padding = Some(zero_padding(length));
     Ok(())
@@ -763,18 +764,44 @@ fn finalize_padding_plan(
         return Ok(());
     };
 
-    if let ClientHelloPaddingMode::PadToHandshakeSize(target_size) = padding.mode() {
-        payload.extensions.padding = Some(Payload::empty());
-        let current_size = encoded_client_hello_len(payload);
-        let padding_len = usize::from(target_size).saturating_sub(current_size);
-        let padding_len = u16::try_from(padding_len).map_err(|_| {
-            Error::General("ClientHello padding size cannot exceed 65535 bytes".into())
-        })?;
-        payload.extensions.padding = Some(zero_padding(padding_len));
+    match padding.mode() {
+        ClientHelloPaddingMode::PadToHandshakeSize(target_size) => {
+            payload.extensions.padding = Some(Payload::empty());
+            let current_size = encoded_client_hello_len(payload);
+            let padding_len = usize::from(target_size).saturating_sub(current_size);
+            let padding_len = u16::try_from(padding_len).map_err(|_| {
+                Error::General("ClientHello padding size cannot exceed 65535 bytes".into())
+            })?;
+            payload.extensions.padding = Some(zero_padding(padding_len));
+        }
+        ClientHelloPaddingMode::BoringSsl { offset } => {
+            // Measured with an empty extension, then without its header:
+            // the length BoringSSL reads, less what `offset` stands for.
+            payload.extensions.padding = Some(Payload::empty());
+            let unpadded = encoded_client_hello_len(payload) - PADDING_EXTENSION_HEADER_LEN;
+            let offset = isize::from(offset);
+            payload.extensions.padding = match boringssl_padding_len(unpadded as isize + offset) {
+                // Left out of the encoding: an extension the custom order
+                // names but the ClientHello does not carry is skipped.
+                None => None,
+                Some(padding_len) => {
+                    let padding_len = (padding_len as isize + offset).max(0) as usize;
+                    let padding_len = u16::try_from(padding_len).map_err(|_| {
+                        Error::General("ClientHello padding size cannot exceed 65535 bytes".into())
+                    })?;
+                    Some(zero_padding(padding_len))
+                }
+            };
+        }
+        ClientHelloPaddingMode::Fixed(_) => {}
     }
 
     Ok(())
 }
+
+/// What a padding extension adds to a ClientHello besides its body: its
+/// type and length.
+const PADDING_EXTENSION_HEADER_LEN: usize = 4;
 
 fn insert_at<T>(items: &mut Vec<T>, position: usize, value: T, what: &str) -> Result<(), Error> {
     if position > items.len() {
@@ -842,6 +869,7 @@ fn apply_grease_plan(
     exts: &mut ClientExtensions<'_>,
     cipher_suites: &mut Vec<CipherSuite>,
     extension_order: Option<&PlannedExtensionOrder>,
+    retry_names_group: bool,
 ) -> Result<(), Error> {
     let Some(grease) = plan.and_then(|plan| plan.grease.as_ref()) else {
         return Ok(());
@@ -886,7 +914,10 @@ fn apply_grease_plan(
         )?;
     }
 
-    if let Some(position) = grease.key_share_position() {
+    if let Some(position) = grease
+        .key_share_position()
+        .filter(|_| !retry_names_group)
+    {
         let Some(key_shares) = exts.key_shares.as_mut() else {
             return Err(Error::General(
                 "ClientHello GREASE key_share requires a key_share extension".into(),
@@ -1184,7 +1215,14 @@ fn emit_client_hello_for_retry(
     apply_advertised_supported_versions_plan(input.plan.as_ref(), &mut exts)?;
     apply_advertised_supported_groups_plan(input.plan.as_ref(), &mut exts)?;
     apply_exact_extension_plan(input.plan.as_ref(), &mut exts)?;
-    apply_raw_key_share_plan(input.plan.as_ref(), &mut exts)?;
+    // A HelloRetryRequest that names a group gets a single key share from it
+    // (RFC 8446 section 4.1.2), the one rustls has just made. The planned
+    // extra shares, raw ones and the GREASE one, belong to the first
+    // ClientHello; a retry that only carries a cookie repeats them.
+    let retry_names_group = retryreq.is_some_and(|hrr| hrr.key_share.is_some());
+    if !retry_names_group {
+        apply_raw_key_share_plan(input.plan.as_ref(), &mut exts)?;
+    }
     apply_padding_plan(input.plan.as_ref(), &mut exts)?;
     // Every extension this ClientHello carries is decided by now, so the
     // planned order can be reconciled with it -- which both the GREASE
@@ -1208,6 +1246,7 @@ fn emit_client_hello_for_retry(
         &mut exts,
         &mut cipher_suites,
         extension_order.as_ref(),
+        retry_names_group,
     )?;
 
     let mut chp_payload = ClientHelloPayload {

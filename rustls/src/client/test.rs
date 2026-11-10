@@ -3413,6 +3413,297 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
 }
 
+/// A TLS 1.3 config offering X25519 alone in its first ClientHello, with
+/// `plan` shaping every ClientHello of the connection.
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+fn retry_test_config(plan: ClientHelloPlan) -> ClientConfig {
+    let mut config =
+        ClientConfig::builder_with_provider(crate::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&crate::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+    config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+        plan: Mutex::new(Some(plan.with_key_share_plan(
+            ClientHelloKeySharePlan::try_from(vec![NamedGroup::X25519]).unwrap(),
+        ))),
+    }));
+    config
+}
+
+/// The two ClientHellos `config` sends around a HelloRetryRequest carrying
+/// `extensions` (and TLS 1.3, and the first ClientHello's session id).
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+fn client_hellos_around_retry(
+    config: ClientConfig,
+    extensions: crate::msgs::handshake::HelloRetryRequestExtensions<'static>,
+) -> (ClientHelloPayload, ClientHelloPayload) {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap()).unwrap();
+    let mut first_flight = Vec::new();
+    conn.write_tls(&mut first_flight)
+        .unwrap();
+    let first = client_hello_in_records(&first_flight);
+
+    let hrr = Message {
+        version: ProtocolVersion::TLSv1_3,
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: first.session_id,
+                extensions: crate::msgs::handshake::HelloRetryRequestExtensions {
+                    supported_versions: Some(ProtocolVersion::TLSv1_3),
+                    ..extensions
+                },
+            }),
+        )),
+    };
+    conn.read_tls(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    conn.process_new_packets().unwrap();
+    let mut second_flight = Vec::new();
+    conn.write_tls(&mut second_flight)
+        .unwrap();
+    (first, client_hello_in_records(&second_flight))
+}
+
+/// The ClientHello among the TLS records in `bytes`, past a
+/// middlebox-compatibility ChangeCipherSpec.
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+fn client_hello_in_records(bytes: &[u8]) -> ClientHelloPayload {
+    let mut reader = Reader::init(bytes);
+    loop {
+        let message = OutboundOpaqueMessage::read(&mut reader)
+            .unwrap()
+            .into_plain_message();
+        if let Ok(Message {
+            payload:
+                MessagePayload::Handshake {
+                    parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(ch)),
+                    ..
+                },
+            ..
+        }) = Message::try_from(message)
+        {
+            return ch;
+        }
+    }
+}
+
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+fn key_share_groups(ch: &ClientHelloPayload) -> Vec<NamedGroup> {
+    ch.extensions
+        .key_shares
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|share| share.group)
+        .collect()
+}
+
+/// A HelloRetryRequest that names a group gets one key share from it
+/// (RFC 8446 section 4.1.2), whichever way the plan adds a GREASE share to
+/// the first ClientHello. OpenSSL and Go's crypto/tls refuse a second
+/// ClientHello carrying more with `illegal_parameter`.
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+#[test]
+fn a_retry_naming_a_group_sends_its_key_share_alone() {
+    let grease = NamedGroup::from(0x0a0a);
+    for plan in [
+        ClientHelloPlan::new().with_raw_key_shares(
+            ClientHelloRawKeyShares::try_from(vec![
+                ClientHelloRawKeyShare::new_at(0, grease, vec![0]).unwrap(),
+            ])
+            .unwrap(),
+        ),
+        ClientHelloPlan::new().with_grease(
+            ClientHelloGreasePlan::new(0x0a0a)
+                .unwrap()
+                .with_key_share_position(0),
+        ),
+    ] {
+        let (first, second) = client_hellos_around_retry(
+            retry_test_config(plan),
+            crate::msgs::handshake::HelloRetryRequestExtensions {
+                key_share: Some(NamedGroup::secp256r1),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(key_share_groups(&first), vec![grease, NamedGroup::X25519]);
+        assert_eq!(key_share_groups(&second), vec![NamedGroup::secp256r1]);
+    }
+}
+
+/// A HelloRetryRequest with a cookie and no group keeps the first
+/// ClientHello's key shares, planned ones included, and the cookie lands
+/// where the planned order puts it; the first ClientHello, which has no
+/// cookie, leaves that entry out.
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+#[test]
+fn a_retry_with_a_cookie_repeats_the_key_shares_and_takes_its_planned_place() {
+    let planned = [
+        ExtensionType::SupportedVersions,
+        ExtensionType::Cookie,
+        ExtensionType::ServerName,
+        ExtensionType::SignatureAlgorithms,
+        ExtensionType::EllipticCurves,
+        ExtensionType::ECPointFormats,
+        ExtensionType::ExtendedMasterSecret,
+        ExtensionType::StatusRequest,
+        ExtensionType::KeyShare,
+        ExtensionType::PSKKeyExchangeModes,
+    ];
+    let plan = ClientHelloPlan::new()
+        .with_raw_key_shares(
+            ClientHelloRawKeyShares::try_from(vec![
+                ClientHelloRawKeyShare::new_at(0, NamedGroup::from(0x0a0a), vec![0]).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .with_extension_order(
+            ClientHelloExtensionOrder::try_from(
+                planned
+                    .iter()
+                    .map(|extension| u16::from(*extension))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+    let mut config = retry_test_config(plan);
+    config.cert_decompressors = Vec::new();
+
+    let (first, second) = client_hellos_around_retry(
+        config,
+        crate::msgs::handshake::HelloRetryRequestExtensions {
+            cookie: Some(PayloadU16::new(vec![1, 2, 3, 4])),
+            ..Default::default()
+        },
+    );
+
+    let without_cookie = planned
+        .iter()
+        .copied()
+        .filter(|extension| *extension != ExtensionType::Cookie)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first
+            .extensions
+            .used_extensions_in_encoding_order(),
+        without_cookie
+    );
+    assert_eq!(
+        second
+            .extensions
+            .used_extensions_in_encoding_order(),
+        planned.to_vec()
+    );
+    assert_eq!(
+        second
+            .extensions
+            .cookie
+            .as_ref()
+            .map(|cookie| cookie.0.clone()),
+        Some(vec![1, 2, 3, 4])
+    );
+    let shares = |ch: &ClientHelloPayload| {
+        ch.extensions
+            .key_shares
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|share| (share.group, share.payload.0.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shares(&second), shares(&first));
+}
+
+#[test]
+fn boringssl_padding_len_is_boringssls_rule() {
+    assert_eq!(super::client_hello::boringssl_padding_len(0xff), None);
+    assert_eq!(
+        super::client_hello::boringssl_padding_len(0x100),
+        Some(0x200 - 0x100 - 4)
+    );
+    assert_eq!(super::client_hello::boringssl_padding_len(494), Some(14));
+    assert_eq!(super::client_hello::boringssl_padding_len(507), Some(1));
+    assert_eq!(super::client_hello::boringssl_padding_len(508), Some(1));
+    assert_eq!(super::client_hello::boringssl_padding_len(511), Some(1));
+    assert_eq!(super::client_hello::boringssl_padding_len(0x200), None);
+    assert!(ClientHelloPaddingPlan::boringssl(512).is_err());
+    assert!(ClientHelloPaddingPlan::boringssl(-512).is_err());
+    assert!(ClientHelloPaddingPlan::boringssl(511).is_ok());
+}
+
+/// Each ClientHello is padded by its own length: the second ClientHello a
+/// HelloRetryRequest asks for, whose P-256 share is 33 bytes longer than
+/// the first one's X25519 share, can leave BoringSSL's window the first sat
+/// in, and the padding goes with it. BoringSSL's rule is restated here.
+#[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
+#[test]
+fn boringssl_padding_follows_each_client_hellos_own_length() {
+    fn encoded_len(ch: &ClientHelloPayload) -> usize {
+        let mut bytes = Vec::new();
+        HandshakeMessagePayload(HandshakePayload::ClientHello(ch.clone())).encode(&mut bytes);
+        bytes.len()
+    }
+    fn padding_len(ch: &ClientHelloPayload) -> Option<usize> {
+        ch.extensions
+            .padding
+            .as_ref()
+            .map(|padding| padding.bytes().len())
+    }
+    fn unpadded_len(ch: &ClientHelloPayload) -> usize {
+        encoded_len(ch) - padding_len(ch).map_or(0, |padding| 4 + padding)
+    }
+    fn assert_pads_as_boringssl(ch: &ClientHelloPayload, offset: isize, what: &str) {
+        let imitated = unpadded_len(ch) as isize + offset;
+        let expected = (256..512).contains(&imitated).then(|| {
+            let padding = 512 - imitated;
+            (if padding > 4 { padding - 4 } else { 1 }) + offset
+        });
+        assert_eq!(
+            padding_len(ch).map(|padding| padding as isize),
+            expected,
+            "{what}: {imitated} bytes before padding, offset {offset}"
+        );
+    }
+    let hellos = |offset: isize| {
+        client_hellos_around_retry(
+            retry_test_config(
+                ClientHelloPlan::new()
+                    .with_padding(ClientHelloPaddingPlan::boringssl(offset).unwrap()),
+            ),
+            crate::msgs::handshake::HelloRetryRequestExtensions {
+                key_share: Some(NamedGroup::secp256r1),
+                ..Default::default()
+            },
+        )
+    };
+
+    let (first, second) = hellos(0);
+    let first_len = unpadded_len(&first) as isize;
+    let growth = unpadded_len(&second) as isize - first_len;
+    assert_eq!(growth, 65 - 32, "a P-256 share in place of an X25519 one");
+
+    // Inside the window both times; the first at the one-byte edge; the
+    // first inside and the second past it; below the window.
+    for imitated_first in [300, 509, 500, 200] {
+        let offset = imitated_first - first_len;
+        let (first, second) = hellos(offset);
+        assert_pads_as_boringssl(&first, offset, "first ClientHello");
+        assert_pads_as_boringssl(&second, offset, "second ClientHello");
+    }
+    let (first, second) = hellos(500 - first_len);
+    assert!(padding_len(&first).is_some());
+    assert_eq!(
+        padding_len(&second),
+        None,
+        "past 511 bytes, no padding extension"
+    );
+}
+
 #[derive(Debug)]
 struct StaticClientHelloCustomizer {
     plan: Mutex<Option<ClientHelloPlan>>,
