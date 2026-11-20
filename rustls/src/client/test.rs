@@ -395,6 +395,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(ClientHelloPlan::new().with_extension_order(order))),
         }));
@@ -1054,6 +1056,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(
                 ClientHelloPlan::new()
@@ -1161,6 +1165,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(
                 ClientHelloPlan::new()
@@ -1215,6 +1221,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(
                 ClientHelloPlan::new()
@@ -1626,6 +1634,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(
                 ClientHelloPlan::new()
@@ -2197,6 +2207,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(
                 ClientHelloPlan::new()
@@ -2251,6 +2263,8 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
+        // The expected extension list has no compress_certificate.
+        config.cert_decompressors.clear();
         config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
             plan: Mutex::new(Some(
                 ClientHelloPlan::new()
