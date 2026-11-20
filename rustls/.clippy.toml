@@ -1,5 +1,10 @@
 upper-case-acronyms-aggressive = true
 
+# Upstream's code is written for Rust 1.71. The manifest says 1.85 because of a
+# dependency this fork adds; without this, Clippy would ask to rewrite upstream's
+# code for the newer version.
+msrv = "1.71"
+
 disallowed-types = [
   { path = "std::sync::Arc", reason = "must use Arc from sync module to support downstream forks targeting architectures without atomic ptrs" },
   { path = "std::sync::Weak", reason = "must use Weak from sync module to support downstream forks targeting architectures without atomic ptrs" },

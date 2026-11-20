@@ -6,7 +6,6 @@ rust-version = "1.85"
 license = "Apache-2.0 OR ISC OR MIT"
 readme = "../README.md"
 description = "A fork of rustls 0.23.46 with an opt-in API for shaping the TLS ClientHello (browser and uTLS fingerprints)."
-homepage = "https://github.com/aimalygin/shaped-rustls"
 repository = "https://github.com/aimalygin/shaped-rustls"
 categories = ["network-programming", "cryptography"]
 keywords = ["tls", "rustls", "clienthello", "fingerprint", "utls"]
