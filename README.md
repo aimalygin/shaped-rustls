@@ -18,11 +18,21 @@ This release is rustls `0.23.46` with the shaping API on top. Everything below
 the next heading is upstream's own README.
 
 The shaping API is dormant unless an application installs a
-`ClientHelloCustomizer` on its `ClientConfig`; without one the crate behaves as
-upstream does. `admin/check-clienthello-compat` compares the default
+`ClientHelloCustomizer` on its `ClientConfig`; without one the crate sends what
+upstream sends. `admin/check-clienthello-compat` compares the default
 ClientHello of this checkout with the upstream tag byte for byte, normalizing
 only the fields that must vary (the random, the session ID and the key share
 bytes).
+
+Two things differ from upstream whether or not a customizer is installed:
+
+* an unknown extension in a TLS 1.3 certificate entry is ignored, where
+  upstream rejects the message. A shaped hello can offer extensions rustls does
+  not implement, and a peer may answer one there; Go's `crypto/tls` ignores
+  them as well. The BoGo test `SendUnknownExtensionOnCertificate-TLS13` is
+  disabled for that reason;
+* the minimum Rust version is 1.85, not 1.71, because of the `shake`
+  dependency of the `aws_lc_rs` feature.
 
 ## Using it
 
@@ -117,7 +127,7 @@ to a wider set of architectures and environments, or compliance requirements.  S
 Specifying `default-features = false` when depending on rustls will remove the implicit
 dependency on aws-lc-rs.
 
-Rustls requires Rust 1.71 or later. It has an optional dependency on zlib-rs which requires 1.75 or later.
+This fork requires Rust 1.85 or later, where upstream rustls requires 1.71: the `aws_lc_rs` feature, on by default, depends on the `shake` crate, which sets that floor.
 
 [ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
 [`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html

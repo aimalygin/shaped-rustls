@@ -1,5 +1,6 @@
 {
   "DisabledTests": {
+    "SendUnknownExtensionOnCertificate-TLS13": "shaped-rustls ignores an unknown extension in a certificate entry, as Go's crypto/tls does",
     "SendV2ClientHello-*": "we only support >=TLS1.2",
     "*SSL3*": "we only support >=TLS1.2",
     "*TLS1-*": "we only support >=TLS1.2",

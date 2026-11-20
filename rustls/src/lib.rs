@@ -24,7 +24,7 @@
 //! Specifying `default-features = false` when depending on rustls will remove the implicit
 //! dependency on aws-lc-rs.
 //!
-//! Rustls requires Rust 1.71 or later. It has an optional dependency on zlib-rs which requires 1.75 or later.
+//! This fork requires Rust 1.85 or later, where upstream rustls requires 1.71: the `aws_lc_rs` feature, on by default, depends on the `shake` crate, which sets that floor.
 //!
 //! [ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
 //! [`crypto::CryptoProvider`]: crate::crypto::CryptoProvider
