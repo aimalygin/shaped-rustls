@@ -274,32 +274,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls"
-version = "0.23.46"
-dependencies = [
- "log",
- "once_cell",
- "rustls-pki-types",
- "rustls-webpki",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "rustls-fuzz"
 version = "0.0.1"
 dependencies = [
  "env_logger",
  "libfuzzer-sys",
- "rustls",
  "rustls-fuzzing-provider",
+ "shaped-rustls",
 ]
 
 [[package]]
 name = "rustls-fuzzing-provider"
 version = "0.1.0"
 dependencies = [
- "rustls",
+ "shaped-rustls",
 ]
 
 [[package]]
@@ -340,6 +328,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "shaped-rustls"
+version = "0.23.4600"
+dependencies = [
+ "log",
+ "once_cell",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]

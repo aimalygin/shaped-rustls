@@ -7,6 +7,8 @@ concurrency:
 
 jobs:
   Fuzzing:
+    # OSS-Fuzz knows the upstream project only.
+    if: github.repository == 'rustls/rustls'
     runs-on: ubuntu-latest
     steps:
     - name: Build Fuzzers
