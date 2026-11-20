@@ -23,6 +23,11 @@ run_clippy --package shaped-rustls --no-default-features --all-targets
 # run all workspace members (individually, because we don't want feature unification)
 for p in $(admin/all-workspace-members) ; do
   case "$p" in
+    rustls-bench)
+      # rustls-graviola is built against upstream's rustls package, whose types
+      # are not this crate's: the bench cannot take it. Every other feature is linted.
+      ALL_FEATURES="--features aws-lc-rs,fips,post-quantum,ring"
+      ;;
     *)
       ALL_FEATURES="--all-features"
       ;;
