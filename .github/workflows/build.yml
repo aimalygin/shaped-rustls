@@ -411,7 +411,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # The check compares the API with the latest release on crates.io. Before
+      # the first release there is nothing to compare with, and it can only fail.
+      - name: Look for a release to compare with
+        id: release
+        run: |
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --user-agent 'shaped-rustls-ci (github.com/aimalygin/shaped-rustls)' \
+            https://crates.io/api/v1/crates/shaped-rustls)
+          case "$code" in
+            200) echo "found=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "shaped-rustls has no release on crates.io yet: nothing to compare with" ;;
+            *) echo "crates.io answered $code"; exit 1 ;;
+          esac
+
       - name: Check semver
+        if: steps.release.outputs.found == 'true'
         uses: obi1kenobi/cargo-semver-checks-action@v2
 
   format:
