@@ -109,10 +109,12 @@ def repo_root():
 def default_upstream_ref(root):
     cargo_toml = root / "rustls" / "Cargo.toml"
     text = cargo_toml.read_text(encoding="utf-8")
-    match = re.search(r'(?m)^version = "([^"]+)"$', text)
+    match = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"$', text)
     if not match:
-        raise ValueError(f"could not find rustls version in {cargo_toml}")
-    return f"v/{match.group(1)}"
+        raise ValueError(f"could not find the crate version in {cargo_toml}")
+    major, minor, patch = (int(part) for part in match.groups())
+    # A shaped-rustls version is `0.23.PPRR`: upstream patch `PP`, fork release `RR`.
+    return f"v/{major}.{minor}.{patch // 100}"
 
 
 def ensure_git_ref(root, ref):
@@ -135,7 +137,7 @@ def extract_ref(root, ref, destination):
         raise subprocess.CalledProcessError(archive.returncode, archive.args, stderr=stderr)
 
 
-def write_harness(path, package_name, rustls_path):
+def write_harness(path, package_name, rustls_path, rustls_package="rustls"):
     src = path / "src"
     src.mkdir(parents=True, exist_ok=True)
     (path / "Cargo.toml").write_text(
@@ -150,7 +152,7 @@ aws_lc_rs = ["rustls/aws_lc_rs"]
 tls12 = ["rustls/tls12"]
 
 [dependencies]
-rustls = {{ path = "{rustls_path}", default-features = false, features = ["std"] }}
+rustls = {{ package = "{rustls_package}", path = "{rustls_path}", default-features = false, features = ["std"] }}
 """,
         encoding="utf-8",
     )
@@ -341,7 +343,12 @@ def main():
 
         extract_ref(root, upstream_ref, upstream_root)
         write_harness(harness_upstream, "rustls-clienthello-compat-upstream", upstream_root / "rustls")
-        write_harness(harness_fork, "rustls-clienthello-compat-fork", root / "rustls")
+        write_harness(
+            harness_fork,
+            "rustls-clienthello-compat-fork",
+            root / "rustls",
+            rustls_package="shaped-rustls",
+        )
 
         print(f"upstream_ref={upstream_ref}")
         print(f"tmpdir={temp_root}")

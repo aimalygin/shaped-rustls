@@ -6,8 +6,6 @@ members = [
   "ci-bench",
   # Network-based tests
   "connect-tests",
-  # tokio-rustls compatibility smoke test
-  "tokio-rustls-smoke",
   # tests and example code
   "examples",
   # Tests that require OpenSSL
@@ -104,8 +102,3 @@ zlib-rs = "0.6"
 [profile.bench]
 codegen-units = 1
 lto = true
-
-# ensure all our tests are against the local copy, never
-# against the latest _published_ copy.
-[patch.crates-io]
-rustls = { path = "rustls" }

@@ -333,8 +333,8 @@ dependencies = [
  "base64 0.22.1",
  "env_logger",
  "nix",
- "rustls",
  "rustls-webpki",
+ "shaped-rustls",
 ]
 
 [[package]]
@@ -2730,34 +2730,16 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
- "bencher",
- "brotli",
- "brotli-decompressor",
- "env_logger",
- "hashbrown 0.15.5",
- "hex",
  "log",
- "macro_rules_attribute",
- "num-bigint",
  "once_cell",
- "rcgen",
- "ring",
  "rustls-pki-types",
- "rustls-test",
  "rustls-webpki",
- "rustversion",
- "serde",
- "serde_json",
- "shake",
  "subtle",
- "time",
- "webpki-roots",
- "x509-parser 0.17.0",
  "zeroize",
- "zlib-rs",
 ]
 
 [[package]]
@@ -2765,10 +2747,10 @@ name = "rustls-bench"
 version = "0.1.0"
 dependencies = [
  "clap",
- "rustls",
  "rustls-graviola",
  "rustls-post-quantum",
  "rustls-test",
+ "shaped-rustls",
  "tikv-jemallocator",
 ]
 
@@ -2784,9 +2766,9 @@ dependencies = [
  "itertools 0.14.0",
  "rayon",
  "rustc-hash",
- "rustls",
  "rustls-fuzzing-provider",
  "rustls-test",
+ "shaped-rustls",
  "tikv-jemallocator",
 ]
 
@@ -2796,7 +2778,7 @@ version = "0.0.1"
 dependencies = [
  "regex",
  "ring",
- "rustls",
+ "shaped-rustls",
  "tokio",
 ]
 
@@ -2810,8 +2792,8 @@ dependencies = [
  "log",
  "mio",
  "rcgen",
- "rustls",
  "serde",
+ "shaped-rustls",
  "tokio",
  "webpki-roots",
 ]
@@ -2821,7 +2803,7 @@ name = "rustls-fuzzing-provider"
 version = "0.1.0"
 dependencies = [
  "env_logger",
- "rustls",
+ "shaped-rustls",
 ]
 
 [[package]]
@@ -2843,7 +2825,7 @@ dependencies = [
  "num-bigint",
  "once_cell",
  "openssl",
- "rustls",
+ "shaped-rustls",
 ]
 
 [[package]]
@@ -2861,7 +2843,7 @@ version = "0.2.2"
 dependencies = [
  "criterion",
  "env_logger",
- "rustls",
+ "shaped-rustls",
  "webpki-roots",
 ]
 
@@ -2882,8 +2864,8 @@ dependencies = [
  "rand_core 0.6.4",
  "rcgen",
  "rsa",
- "rustls",
  "sha2",
+ "shaped-rustls",
  "signature",
  "webpki-roots",
  "x25519-dalek",
@@ -2894,17 +2876,17 @@ name = "rustls-provider-test"
 version = "0.1.0"
 dependencies = [
  "hex",
- "rustls",
  "rustls-provider-example",
  "serde",
  "serde_json",
+ "shaped-rustls",
 ]
 
 [[package]]
 name = "rustls-test"
 version = "0.1.0"
 dependencies = [
- "rustls",
+ "shaped-rustls",
 ]
 
 [[package]]
@@ -3023,6 +3005,39 @@ dependencies = [
  "digest 0.11.3",
  "keccak",
  "sponge-cursor",
+]
+
+[[package]]
+name = "shaped-rustls"
+version = "0.23.4600"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "bencher",
+ "brotli",
+ "brotli-decompressor",
+ "env_logger",
+ "hashbrown 0.15.5",
+ "hex",
+ "log",
+ "macro_rules_attribute",
+ "num-bigint",
+ "once_cell",
+ "rcgen",
+ "ring",
+ "rustls-pki-types",
+ "rustls-test",
+ "rustls-webpki",
+ "rustversion",
+ "serde",
+ "serde_json",
+ "shake",
+ "subtle",
+ "time",
+ "webpki-roots",
+ "x509-parser 0.17.0",
+ "zeroize",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3345,16 +3360,6 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "tokio-rustls-smoke"
-version = "0.0.0"
-dependencies = [
- "rcgen",
- "rustls",
- "tokio",
- "tokio-rustls",
 ]
 
 [[package]]

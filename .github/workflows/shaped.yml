@@ -1,0 +1,43 @@
+name: shaped-rustls
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ['shaped/**', 'xray/**']
+  pull_request:
+    branches: ['shaped/**', 'xray/**']
+
+concurrency:
+  group: shaped-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ring
+          - ring,brotli,zlib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Library, integration and doc tests
+        run: cargo test --locked -p shaped-rustls --features ${{ matrix.features }}
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the crate as crates.io would receive it
+        run: cargo package --locked -p shaped-rustls

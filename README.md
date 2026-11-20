@@ -6,16 +6,40 @@
 Rustls is a modern TLS library written in Rust.
 </p>
 
-# shaped-rustls ClientHello shaping branch
+# shaped-rustls
 
-This branch is based on rustls `0.23.40` and adds opt-in ClientHello shaping
-support for xray/uTLS-compatible fingerprints.
+shaped-rustls is a fork of [rustls](https://github.com/rustls/rustls) with an
+opt-in API for shaping the TLS ClientHello, so that a client can send the hello
+of a browser or of a uTLS profile byte for byte. It is not affiliated with or
+endorsed by the rustls project: please report its bugs
+[here](https://github.com/aimalygin/shaped-rustls/issues), not upstream.
 
-The default rustls behavior is intended to remain compatible with upstream when
-no `ClientHelloCustomizer` is configured. The shaping API is dormant unless an
-application explicitly installs a customizer on `ClientConfig`.
+This release is rustls `0.23.46` with the shaping API on top. Everything below
+the next heading is upstream's own README.
 
-This branch adds primitives for:
+The shaping API is dormant unless an application installs a
+`ClientHelloCustomizer` on its `ClientConfig`; without one the crate behaves as
+upstream does. `admin/check-clienthello-compat` compares the default
+ClientHello of this checkout with the upstream tag byte for byte, normalizing
+only the fields that must vary (the random, the session ID and the key share
+bytes).
+
+## Using it
+
+The package is named `shaped-rustls`, and its library is still named `rustls`,
+so code written for rustls compiles against it unchanged:
+
+```toml
+[dependencies]
+rustls = { package = "shaped-rustls", version = "0.23.4600" }
+```
+
+Crates that depend on the `rustls` package itself, such as tokio-rustls, quinn
+or hyper-rustls, keep using upstream rustls, and its types are not
+interchangeable with this crate's. A shaped hello under one of them needs an
+adapter built against this crate.
+
+## What it adds
 
 * fixed ClientHello random and session ID values;
 * custom and advertised cipher suites;
@@ -24,12 +48,22 @@ This branch adds primitives for:
 * GREASE values and GREASE extension placement;
 * raw key shares and fixed X25519 key shares, including the classical X25519
   component inside hybrid `X25519MLKEM768` key shares;
-* padding and raw ClientHello capture for byte-level verification.
+* padding, including BoringSSL's rule evaluated anew for each flight;
+* a retried ClientHello, after a HelloRetryRequest that names a group, with
+  that group's key share alone, as uTLS sends it;
+* raw ClientHello capture for byte-level verification.
 
-The release tag for this work is `xray-rustls-0.23.40-1`. The helper script
-`admin/check-clienthello-compat` compares the default ClientHello emitted by
-this checkout against the upstream rustls tag and normalizes only fields that
-must vary, such as random values and ephemeral key share bytes.
+## Versions
+
+A version is `0.23.PPRR`: `PP` is the upstream rustls patch release this one
+is based on and `RR` counts the fork's own releases on that base. `0.23.4600`
+is the first release on rustls `0.23.46`; a fix of the fork alone would be
+`0.23.4601`, and a move to rustls `0.23.47` would be `0.23.4700`. A `^0.23`
+requirement therefore follows both, as it would for rustls.
+
+Security fixes of upstream rustls reach this crate only when it is rebased.
+RustSec advisories are filed against `rustls`, and tools such as `cargo audit`
+do not match them to `shaped-rustls`: check the upstream base named above.
 
 # Status
 
