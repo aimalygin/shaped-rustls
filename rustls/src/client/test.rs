@@ -1425,6 +1425,8 @@ mod tests {
             .assert_matches_encoded(&encoded);
     }
 
+    // The FIPS provider offers no X25519 key share.
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn client_hello_oracle_can_place_forced_and_grease_extensions_before_padding() {
         static BROTLI_DECOMPRESSOR: TestCertDecompressor =
@@ -2436,7 +2438,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "aws_lc_rs")]
+    // The FIPS provider offers no X25519 key share.
+    #[cfg(all(feature = "aws_lc_rs", not(feature = "fips")))]
     #[test]
     fn fixed_x25519_can_be_mixed_with_provider_backed_p256() {
         let private_key =
