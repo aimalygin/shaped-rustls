@@ -812,9 +812,9 @@ const PADDING_EXTENSION_HEADER_LEN: usize = 4;
 
 fn insert_at<T>(items: &mut Vec<T>, position: usize, value: T, what: &str) -> Result<(), Error> {
     if position > items.len() {
-        return Err(Error::General(
-            format!("ClientHello GREASE position is out of range for {what}").into(),
-        ));
+        return Err(Error::General(format!(
+            "ClientHello GREASE position is out of range for {what}"
+        )));
     }
 
     items.insert(position, value);
@@ -1339,17 +1339,15 @@ fn emit_client_hello_for_retry(
         }
         // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
         // ECH.
-        (EchStatus::NotOffered, None) => {
-            if !has_exact_ech {
-                if let Some(grease_ext) = ech_grease_ext {
-                    // Add the GREASE ECH extension.
-                    let grease_ext = grease_ext?;
-                    chp_payload.encrypted_client_hello = Some(grease_ext.clone());
-                    cx.data.ech_status = EchStatus::Grease;
-                    // Store the GREASE ECH extension in case we need to carry it forward in a
-                    // subsequent hello.
-                    input.prev_ech_ext = Some(grease_ext);
-                }
+        (EchStatus::NotOffered, None) if !has_exact_ech => {
+            if let Some(grease_ext) = ech_grease_ext {
+                // Add the GREASE ECH extension.
+                let grease_ext = grease_ext?;
+                chp_payload.encrypted_client_hello = Some(grease_ext.clone());
+                cx.data.ech_status = EchStatus::Grease;
+                // Store the GREASE ECH extension in case we need to carry it forward in a
+                // subsequent hello.
+                input.prev_ech_ext = Some(grease_ext);
             }
         }
         _ => {}

@@ -1093,19 +1093,18 @@ fn insert_positioned_grease(
     grease: &[(usize, ExtensionType, Payload<'static>)],
 ) {
     let real_order = core::mem::take(order);
-    let real_order_len = real_order.len();
-
-    for position in 0..=real_order_len {
-        for (_, extension, _) in grease
+    let grease_at = |position: usize| {
+        grease
             .iter()
-            .filter(|(grease_position, _, _)| *grease_position == position)
-        {
-            order.push(*extension);
-        }
-        if position < real_order_len {
-            order.push(real_order[position]);
-        }
+            .filter(move |(grease_position, _, _)| *grease_position == position)
+            .map(|(_, extension, _)| *extension)
+    };
+
+    for (position, extension) in real_order.iter().enumerate() {
+        order.extend(grease_at(position));
+        order.push(*extension);
     }
+    order.extend(grease_at(real_order.len()));
 }
 
 impl ClientExtensions<'_> {

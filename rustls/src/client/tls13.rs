@@ -366,21 +366,20 @@ pub(super) fn initial_key_shares(
         return planned_key_shares(config, kx_state, plan, key_share_plan.as_slice());
     }
 
-    let planned_group = match plan.and_then(|plan| plan.supported_groups.as_ref()) {
-        Some(groups) => {
-            let mut selected = None;
-            for group_name in groups.as_slice() {
-                let Some(group) = config.find_kx_group(*group_name, ProtocolVersion::TLSv1_3)
-                else {
-                    return Err(Error::General(
+    // A plan's first supported group is the one whose key share goes out.
+    let planned_group = match plan
+        .and_then(|plan| plan.supported_groups.as_ref())
+        .and_then(|groups| groups.as_slice().first())
+    {
+        Some(group_name) => Some(
+            config
+                .find_kx_group(*group_name, ProtocolVersion::TLSv1_3)
+                .ok_or_else(|| {
+                    Error::General(
                         "ClientHello supported group is not supported by this config".into(),
-                    ));
-                };
-                selected = Some(group);
-                break;
-            }
-            selected
-        }
+                    )
+                })?,
+        ),
         None => None,
     };
 
