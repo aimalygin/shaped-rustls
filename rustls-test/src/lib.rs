@@ -1025,6 +1025,11 @@ impl io::Write for TestNonBlockIo {
 
 impl Drop for TestNonBlockIo {
     fn drop(&mut self) {
+        // avoid aborting on a double panic, which would hide the original failure
+        if std::thread::panicking() {
+            return;
+        }
+
         // ensure the object was exhausted as expected
         assert!(self.reads.is_empty());
         assert!(self.writes.is_empty());
@@ -1432,12 +1437,16 @@ impl RawTls {
 
         let encrypter = match (tx_keys, suite) {
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls13(tls13),
             ) => tls13.aead_alg.encrypter(key, iv),
 
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
             ) => tls12
                 .aead_alg
@@ -1448,12 +1457,16 @@ impl RawTls {
 
         let decrypter = match (rx_keys, suite) {
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls13(tls13),
             ) => tls13.aead_alg.decrypter(key, iv),
 
             (
-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+                rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | rustls::ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
                 SupportedCipherSuite::Tls12(tls12),
             ) => tls12
                 .aead_alg
@@ -1475,14 +1488,20 @@ impl RawTls {
         msg: &PlainMessage,
         peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
     ) {
+        let data = self.encrypt(msg);
+        peer.read_tls(&mut io::Cursor::new(data))
+            .unwrap();
+    }
+
+    /// Encrypt `msg` into a complete TLS record, including its header
+    pub fn encrypt(&mut self, msg: &PlainMessage) -> Vec<u8> {
         let data = self
             .encrypter
             .encrypt(msg.borrow_outbound(), self.enc_seq)
             .unwrap()
             .encode();
         self.enc_seq += 1;
-        peer.read_tls(&mut io::Cursor::new(data))
-            .unwrap();
+        data
     }
 
     pub fn receive_and_decrypt(
@@ -1804,20 +1823,32 @@ pub mod encoding {
             }
         }
 
-        pub fn new_dummy_key_share() -> Self {
-            const SOME_POINT_ON_P256: &[u8] = &[
-                4, 41, 39, 177, 5, 18, 186, 227, 237, 220, 254, 70, 120, 40, 18, 139, 173, 41, 3,
-                38, 153, 25, 247, 8, 96, 105, 200, 196, 223, 108, 115, 40, 56, 199, 120, 121, 100,
-                234, 172, 0, 229, 146, 31, 177, 73, 138, 96, 244, 96, 103, 102, 179, 217, 104, 80,
-                1, 85, 141, 26, 151, 78, 115, 65, 81, 62,
-            ];
+        pub fn new_versions_server_tls13() -> Self {
+            Self {
+                typ: ExtensionType::SupportedVersions,
+                body: ProtocolVersion::TLSv1_3
+                    .to_array()
+                    .to_vec(),
+            }
+        }
 
-            let mut share = len_u16(SOME_POINT_ON_P256.to_vec());
+        pub fn new_dummy_key_share() -> Self {
+            let mut share = len_u16(Self::SOME_POINT_ON_P256.to_vec());
             share.splice(0..0, NamedGroup::secp256r1.to_array());
 
             Self {
                 typ: ExtensionType::KeyShare,
                 body: len_u16(share),
+            }
+        }
+
+        pub fn new_dummy_key_share_server() -> Self {
+            let mut share = len_u16(Self::SOME_POINT_ON_P256.to_vec());
+            share.splice(0..0, NamedGroup::secp256r1.to_array());
+
+            Self {
+                typ: ExtensionType::KeyShare,
+                body: share,
             }
         }
 
@@ -1827,6 +1858,13 @@ pub mod encoding {
                 body: len_u16(body.to_vec()),
             }
         }
+
+        const SOME_POINT_ON_P256: &[u8] = &[
+            4, 41, 39, 177, 5, 18, 186, 227, 237, 220, 254, 70, 120, 40, 18, 139, 173, 41, 3, 38,
+            153, 25, 247, 8, 96, 105, 200, 196, 223, 108, 115, 40, 56, 199, 120, 121, 100, 234,
+            172, 0, 229, 146, 31, 177, 73, 138, 96, 244, 96, 103, 102, 179, 217, 104, 80, 1, 85,
+            141, 26, 151, 78, 115, 65, 81, 62,
+        ];
     }
 
     /// Prefix with u8 length

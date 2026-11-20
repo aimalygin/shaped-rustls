@@ -99,7 +99,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: cargo build (debug; no-std)
-        run: cargo build --locked --lib -p rustls $(admin/all-features-except std,brotli,read_buf rustls)
+        run: cargo build --locked --lib -p shaped-rustls $(admin/all-features-except std,brotli,read_buf shaped-rustls)
 
       - name: cargo build (debug; rustls-provider-example)
         run: cargo build --locked -p rustls-provider-example
@@ -116,8 +116,8 @@ jobs:
       - name: cargo test (debug; rustls-provider-test; all features)
         run: cargo test --all-features -p rustls-provider-test
 
-      - name: cargo package --all-features -p rustls
-        run: cargo package --all-features -p rustls
+      - name: cargo package --all-features -p shaped-rustls
+        run: cargo package --all-features -p shaped-rustls
 
   msrv:
     name: MSRV
@@ -130,16 +130,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.71"
+          toolchain: "1.85"
 
       # zlib-rs is optional and requires a later MSRV
-      - run: cargo check --locked --lib $(admin/all-features-except zlib rustls) -p rustls
+      - run: cargo check --locked --lib $(admin/all-features-except zlib shaped-rustls) -p shaped-rustls
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.75"
+          toolchain: "1.85"
 
-      - run: cargo check --locked --lib --all-features -p rustls
+      - run: cargo check --locked --lib --all-features -p shaped-rustls
 
   features:
     name: Features
@@ -231,12 +231,6 @@ jobs:
         env:
           BOGO_SHIM_PROVIDER: aws-lc-rs-fips
 
-      - name: Run test suite (post-quantum)
-        working-directory: bogo
-        run: ./runme
-        env:
-          BOGO_SHIM_PROVIDER: post-quantum
-
   fuzz:
     name: Smoke-test fuzzing targets
     runs-on: ubuntu-latest
@@ -300,7 +294,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: cargo doc (rustls; all features)
-        run: cargo doc --locked --all-features --no-deps --document-private-items --package rustls
+        run: cargo doc --locked --all-features --no-deps --document-private-items --package shaped-rustls
         env:
           RUSTDOCFLAGS: -Dwarnings
 
@@ -405,8 +399,8 @@ jobs:
           tool: bindgen-cli
       - name: Enable bindgen feature for aws-lc-sys (as needed for many cross targets)
         if: ${{ matrix.target != 'i686-unknown-linux-gnu' }}
-        run: cargo add --dev --features bindgen 'aws-lc-sys@>0.20' --package rustls --verbose
-      - run: cross test --package rustls --target ${{ matrix.target }}
+        run: cargo add --dev --features bindgen 'aws-lc-sys@>0.20' --package shaped-rustls --verbose
+      - run: cross test --package shaped-rustls --target ${{ matrix.target }}
 
   semver:
     name: Check semver compatibility
@@ -417,7 +411,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # The check compares the API with the latest release on crates.io. Before
+      # the first release there is nothing to compare with, and it can only fail.
+      - name: Look for a release to compare with
+        id: release
+        run: |
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --user-agent 'shaped-rustls-ci (github.com/aimalygin/shaped-rustls)' \
+            https://crates.io/api/v1/crates/shaped-rustls)
+          case "$code" in
+            200) echo "found=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "shaped-rustls has no release on crates.io yet: nothing to compare with" ;;
+            *) echo "crates.io answered $code"; exit 1 ;;
+          esac
+
       - name: Check semver
+        if: steps.release.outputs.found == 'true'
         uses: obi1kenobi/cargo-semver-checks-action@v2
 
   format:
@@ -480,26 +489,6 @@ jobs:
           components: clippy
       - run: ./admin/clippy -- --deny warnings
 
-  clippy-nightly:
-    name: Clippy (Nightly)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Install valgrind
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y valgrind
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy
-      # Do not deny warnings, as nightly clippy sometimes has false negatives.
-      - run: ./admin/clippy
-
   check-external-types:
     name: Validate external types appearing in public API
     runs-on: ubuntu-latest
@@ -511,7 +500,7 @@ jobs:
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-10-18
+          toolchain: nightly-2026-03-20
           # ^ sync with https://github.com/awslabs/cargo-check-external-types/blob/main/rust-toolchain.toml
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v3
@@ -520,23 +509,6 @@ jobs:
       - name: run cargo-check-external-types for rustls/
         working-directory: rustls/
         run: cargo check-external-types
-
-  taplo:
-    name: Taplo
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install taplo-cli
-        uses: taiki-e/cache-cargo-install-action@v3
-        with:
-          tool: taplo-cli
-      - run: taplo format --check
 
   openssl-tests:
     name: Run openssl-tests

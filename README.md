@@ -6,16 +6,50 @@
 Rustls is a modern TLS library written in Rust.
 </p>
 
-# shaped-rustls ClientHello shaping branch
+# shaped-rustls
 
-This branch is based on rustls `0.23.40` and adds opt-in ClientHello shaping
-support for xray/uTLS-compatible fingerprints.
+shaped-rustls is a fork of [rustls](https://github.com/rustls/rustls) with an
+opt-in API for shaping the TLS ClientHello, so that a client can send the hello
+of a browser or of a uTLS profile byte for byte. It is not affiliated with or
+endorsed by the rustls project: please report its bugs
+[here](https://github.com/aimalygin/shaped-rustls/issues), not upstream.
 
-The default rustls behavior is intended to remain compatible with upstream when
-no `ClientHelloCustomizer` is configured. The shaping API is dormant unless an
-application explicitly installs a customizer on `ClientConfig`.
+This release is rustls `0.23.46` with the shaping API on top. Everything below
+the next heading is upstream's own README.
 
-This branch adds primitives for:
+The shaping API is dormant unless an application installs a
+`ClientHelloCustomizer` on its `ClientConfig`; without one the crate sends what
+upstream sends. `admin/check-clienthello-compat` compares the default
+ClientHello of this checkout with the upstream tag byte for byte, normalizing
+only the fields that must vary (the random, the session ID and the key share
+bytes).
+
+Two things differ from upstream whether or not a customizer is installed:
+
+* an unknown extension in a TLS 1.3 certificate entry is ignored, where
+  upstream rejects the message. A shaped hello can offer extensions rustls does
+  not implement, and a peer may answer one there; Go's `crypto/tls` ignores
+  them as well. The BoGo test `SendUnknownExtensionOnCertificate-TLS13` is
+  disabled for that reason;
+* the minimum Rust version is 1.85, not 1.71, because of the `shake`
+  dependency of the `aws_lc_rs` feature.
+
+## Using it
+
+The package is named `shaped-rustls`, and its library is still named `rustls`,
+so code written for rustls compiles against it unchanged:
+
+```toml
+[dependencies]
+rustls = { package = "shaped-rustls", version = "0.23.4600" }
+```
+
+Crates that depend on the `rustls` package itself, such as tokio-rustls, quinn
+or hyper-rustls, keep using upstream rustls, and its types are not
+interchangeable with this crate's. A shaped hello under one of them needs an
+adapter built against this crate.
+
+## What it adds
 
 * fixed ClientHello random and session ID values;
 * custom and advertised cipher suites;
@@ -24,12 +58,22 @@ This branch adds primitives for:
 * GREASE values and GREASE extension placement;
 * raw key shares and fixed X25519 key shares, including the classical X25519
   component inside hybrid `X25519MLKEM768` key shares;
-* padding and raw ClientHello capture for byte-level verification.
+* padding, including BoringSSL's rule evaluated anew for each flight;
+* a retried ClientHello, after a HelloRetryRequest that names a group, with
+  that group's key share alone, as uTLS sends it;
+* raw ClientHello capture for byte-level verification.
 
-The release tag for this work is `xray-rustls-0.23.40-1`. The helper script
-`admin/check-clienthello-compat` compares the default ClientHello emitted by
-this checkout against the upstream rustls tag and normalizes only fields that
-must vary, such as random values and ephemeral key share bytes.
+## Versions
+
+A version is `0.23.PPRR`: `PP` is the upstream rustls patch release this one
+is based on and `RR` counts the fork's own releases on that base. `0.23.4600`
+is the first release on rustls `0.23.46`; a fix of the fork alone would be
+`0.23.4601`, and a move to rustls `0.23.47` would be `0.23.4700`. A `^0.23`
+requirement therefore follows both, as it would for rustls.
+
+Security fixes of upstream rustls reach this crate only when it is rebased.
+RustSec advisories are filed against `rustls`, and tools such as `cargo audit`
+do not match them to `shaped-rustls`: check the upstream base named above.
 
 # Status
 
@@ -37,10 +81,10 @@ Rustls is used in production at many organizations and projects. We aim to maint
 reasonable API surface stability but the API may evolve as we make changes to accommodate
 new features or performance improvements.
 
-We have a [roadmap](ROADMAP.md) for our future plans. We also have [benchmarks](BENCHMARKING.md) to
+We have a [roadmap](https://github.com/rustls/rustls/blob/rel-0.23/ROADMAP.md) for our future plans. We also have [benchmarks](https://github.com/rustls/rustls/blob/rel-0.23/BENCHMARKING.md) to
 prevent performance regressions and to let you evaluate rustls on your target hardware.
 
-If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+If you'd like to help out, please see [CONTRIBUTING.md](https://github.com/rustls/rustls/blob/rel-0.23/CONTRIBUTING.md).
 
 [![Build Status](https://github.com/rustls/rustls/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/rustls/rustls/actions/workflows/build.yml?query=branch%3Amain)
 [![Coverage Status (codecov.io)](https://codecov.io/gh/rustls/rustls/branch/main/graph/badge.svg)](https://codecov.io/gh/rustls/rustls/)
@@ -83,7 +127,7 @@ to a wider set of architectures and environments, or compliance requirements.  S
 Specifying `default-features = false` when depending on rustls will remove the implicit
 dependency on aws-lc-rs.
 
-Rustls requires Rust 1.71 or later. It has an optional dependency on zlib-rs which requires 1.75 or later.
+This fork requires Rust 1.85 or later, where upstream rustls requires 1.71: the `aws_lc_rs` feature, on by default, depends on the `shake` crate, which sets that floor.
 
 [ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
 [`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html

@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 clap = { workspace = true }
-rustls = { path = "../rustls" }
+rustls = { package = "shaped-rustls", path = "../rustls" }
 rustls-graviola = { workspace = true, optional = true }
 rustls-post-quantum = { path = "../rustls-post-quantum", optional = true }
 rustls-test = { workspace = true }

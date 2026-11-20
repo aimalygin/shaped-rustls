@@ -1,18 +1,23 @@
 [package]
-name = "rustls"
-version = "0.23.40"
+name = "shaped-rustls"
+version = "0.23.4600"
 edition = "2021"
-rust-version = "1.71"
+rust-version = "1.85"
 license = "Apache-2.0 OR ISC OR MIT"
 readme = "../README.md"
-description = "Rustls is a modern TLS library written in Rust."
-homepage = "https://github.com/rustls/rustls"
-repository = "https://github.com/rustls/rustls"
+description = "A fork of rustls 0.23.46 with an opt-in API for shaping the TLS ClientHello (browser and uTLS fingerprints)."
+repository = "https://github.com/aimalygin/shaped-rustls"
 categories = ["network-programming", "cryptography"]
+keywords = ["tls", "rustls", "clienthello", "fingerprint", "utls"]
 autobenches = false
 autotests = false
 exclude = ["src/testdata", "tests/**"]
 build = "build.rs"
+
+# The library keeps upstream's name, so that code written for rustls compiles
+# against this package unchanged.
+[lib]
+name = "rustls"
 
 [features]
 default = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]
